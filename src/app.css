@@ -1,0 +1,107 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+:root {
+    --font-heading: "Plus Jakarta Sans", sans-serif;
+    --font-body: "Plus Jakarta Sans", sans-serif;
+
+    /* Modern Dark Palette - Vercel/Linear Inspired */
+    --bg-main: #0a0a0a;
+    --bg-card: #141414;
+    --bg-elevated: #1a1a1a;
+
+    --border-subtle: #1f1f1f;
+    --border-hover: #333333;
+    --border-bold: #444444;
+
+    --text-primary: #ffffff;
+    --text-secondary: #a1a1aa;
+    --text-muted: #71717a;
+    --text-disabled: #52525b;
+
+    /* Semantic Colors */
+    --accent-gold: #eab308;
+    --error: #ef4444;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --info: #3b82f6;
+
+    /* Fluid Spacing - scales from 1080p to 4K */
+    --space-unit: clamp(6px, 0.5vw, 10px);
+    --space-xs: clamp(2px, 0.25vw, 6px);
+    --space-sm: clamp(6px, 0.5vw, 12px);
+    --space-md: clamp(12px, 1vw, 20px);
+    --space-lg: clamp(20px, 1.5vw, 40px);
+    --space-xl: clamp(32px, 2.5vw, 64px);
+    --space-xxl: clamp(64px, 5vw, 140px);
+
+    /* Fluid Typography */
+    --text-xs: clamp(0.65rem, 0.6rem + 0.15vw, 0.75rem);
+    --text-sm: clamp(0.75rem, 0.7rem + 0.2vw, 0.875rem);
+    --text-base: clamp(0.875rem, 0.8rem + 0.25vw, 1rem);
+
+    /* Radius */
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 16px;
+
+    /* Transitions */
+    --transition-fast: 0.15s ease;
+    --transition-base: 0.25s ease;
+
+    /* Max content width for 4K readability */
+    --max-content-width: min(1600px, 90vw);
+}
+
+body {
+    margin: 0;
+    font-family: var(--font-body);
+    background: var(--bg-main);
+    color: var(--text-secondary);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.01em;
+    overflow-x: hidden;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+.glass {
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.skeleton {
+    display: inline-block;
+    height: 1.5rem;
+    width: 100px;
+    background: var(--border-subtle);
+    border-radius: var(--radius-sm);
+    position: relative;
+    overflow: hidden;
+}
+
+.skeleton::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background: linear-gradient(90deg,
+            transparent,
+            rgba(255, 255, 255, 0.05),
+            transparent);
+    animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+    0% {
+        transform: translateX(-100%);
+    }
+
+    100% {
+        transform: translateX(100%);
+    }
+}
