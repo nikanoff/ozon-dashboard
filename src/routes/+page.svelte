@@ -311,7 +311,7 @@
 <div class="dashboard">
     <header class="header">
         <div class="header-content">
-            <h1>Ozon Dashboard</h1>
+            <h1><a href="/" class="title-link">Ozon Dashboard</a></h1>
             <p class="subtitle">
                 Real-time business insights for Seller ID: {$ozonKeys.clientId ||
                     "Not Configured"}
@@ -767,6 +767,35 @@
         margin: 0;
         letter-spacing: 0.15em;
         text-transform: uppercase;
+    }
+
+    .title-link {
+        color: inherit;
+        text-decoration: none;
+        transition: all 0.3s ease;
+        display: inline-block;
+        position: relative;
+    }
+
+    .title-link::after {
+        content: "";
+        position: absolute;
+        width: 0;
+        height: 1px;
+        bottom: -2px;
+        left: 0;
+        background-color: var(--accent-gold);
+        transition: width 0.3s ease;
+        opacity: 0.7;
+    }
+
+    .title-link:hover {
+        color: var(--accent-gold);
+        text-shadow: 0 0 15px rgba(212, 175, 55, 0.3);
+    }
+
+    .title-link:hover::after {
+        width: 100%;
     }
 
     .subtitle {

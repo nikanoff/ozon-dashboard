@@ -5,52 +5,43 @@
     import OzonAuth from "$lib/components/OzonAuth.svelte";
     import { onDestroy } from "svelte";
     import { page } from "$app/stores";
-    import { onMount } from "svelte";
+    import { tick } from "svelte";
 
     let highlightSku: string | null = null;
+    let hasScrolled = false;
 
-    // Subscribe to page changes to update highlightSku when URL changes
-    $: {
-        highlightSku = $page.url.searchParams.get("highlight");
-        console.log("Highlight SKU:", highlightSku);
+    // Reactively update SKU from URL
+    $: highlightSku = $page.url.searchParams.get("highlight");
 
-        // Scroll to the highlighted element when it becomes available
-        if (highlightSku) {
-            // Wait for the DOM to update before scrolling
-            setTimeout(() => {
-                // Only run in browser environment where document is available
-                if (
-                    typeof document !== "undefined" &&
-                    typeof window !== "undefined"
-                ) {
-                    // First try to find element by data attribute, then by class
-                    let highlightedElement = document.querySelector(
-                        `.product-info-td[data-sku="${highlightSku}"]`,
-                    );
-                    if (!highlightedElement) {
-                        highlightedElement = document.querySelector(
-                            ".product-info-td.highlighted",
-                        );
-                    }
-                    if (highlightedElement) {
-                        // Add the scroll-highlight class to trigger animation
-                        highlightedElement.classList.add("scroll-highlight");
-                        highlightedElement.scrollIntoView({
-                            behavior: "smooth",
-                            block: "center",
-                        });
-                        // Remove the animation class after it completes
-                        setTimeout(() => {
-                            if (highlightedElement) {
-                                highlightedElement.classList.remove(
-                                    "scroll-highlight",
-                                );
-                            }
-                        }, 1500); // Match the animation duration
-                    }
-                }
-            }, 10); // Small delay to ensure DOM is updated
-        }
+    // Robust scroll logic: Runs when data exists AND we have a target SKU
+    $: if (highlightSku && $stocksData?.items?.length) {
+        handleScroll();
+    }
+
+    async function handleScroll() {
+        // Wait for DOM to render the new list
+        await tick();
+
+        // Give a tiny buffer for browser layout calculation
+        setTimeout(() => {
+            const element = document.querySelector(
+                `tr[data-sku="${highlightSku}"]`,
+            );
+
+            if (element) {
+                element.scrollIntoView({
+                    behavior: "smooth",
+                    block: "center",
+                });
+
+                element.classList.add("scroll-highlight");
+
+                // Remove class after animation
+                setTimeout(() => {
+                    element.classList.remove("scroll-highlight");
+                }, 2000);
+            }
+        }, 100);
     }
 
     const swrResult = useSWR(
@@ -131,7 +122,7 @@
 <div class="dashboard">
     <header class="header">
         <div class="header-content">
-            <h1>Product Stocks</h1>
+            <h1><a href="/stocks" class="title-link">Product Stocks</a></h1>
             <p class="subtitle">
                 Inventory management for Seller ID: {$ozonKeys.clientId ||
                     "Not Configured"}
@@ -314,7 +305,11 @@
                             {/each}
                         {:else if $stocksData && $stocksData.items}
                             {#each $stocksData.items as item (item.product_id)}
-                                <tr>
+                                <tr
+                                    class:highlighted={item.stocks?.[0]?.sku ==
+                                        highlightSku}
+                                    data-sku={item.stocks?.[0]?.sku}
+                                >
                                     <td>
                                         <div class="product-image-container">
                                             {#if $stocksData?.imagesMap?.[String(item.product_id)]}
@@ -355,13 +350,7 @@
                                             {/if}
                                         </div>
                                     </td>
-                                    <td
-                                        class="product-info-td {item.stocks?.[0]
-                                            ?.sku == highlightSku
-                                            ? 'highlighted'
-                                            : ''}"
-                                        data-sku={item.stocks?.[0]?.sku}
-                                    >
+                                    <td class="product-info-td">
                                         <div class="product-info">
                                             <code class="offer-id"
                                                 >{item.offer_id}</code
@@ -439,6 +428,35 @@
         margin: 0;
         letter-spacing: 0.15em;
         text-transform: uppercase;
+    }
+
+    .title-link {
+        color: inherit;
+        text-decoration: none;
+        transition: all 0.3s ease;
+        display: inline-block;
+        position: relative;
+    }
+
+    .title-link::after {
+        content: "";
+        position: absolute;
+        width: 0;
+        height: 1px;
+        bottom: -2px;
+        left: 0;
+        background-color: var(--accent-gold);
+        transition: width 0.3s ease;
+        opacity: 0.7;
+    }
+
+    .title-link:hover {
+        color: var(--accent-gold);
+        text-shadow: 0 0 15px rgba(212, 175, 55, 0.3);
+    }
+
+    .title-link:hover::after {
+        width: 100%;
     }
 
     .subtitle {
@@ -671,22 +689,42 @@
         overflow-wrap: break-word;
     }
 
-    .product-info-td.highlighted {
-        background-color: rgba(
-            212,
-            175,
-            55,
-            0.2
-        ) !important; /* Gold highlight to match the theme */
-        border-left: 3px solid #d4af37 !important;
-        transition: all 0.3s ease;
+    tr.highlighted {
+        background-color: rgba(212, 175, 55, 0.1) !important;
+        position: relative;
+        z-index: 1;
     }
 
-    .product-info-td.highlighted .product-info,
-    .product-info-td.highlighted .sku-label,
-    .product-info-td.highlighted .offer-id {
+    tr.highlighted td:first-child {
+        box-shadow: inset 3px 0 0 var(--accent-gold);
+    }
+
+    tr.highlighted .product-info,
+    tr.highlighted .sku-label,
+    tr.highlighted .offer-id {
         color: #d4af37 !important; /* Gold text color */
         font-weight: 600;
+    }
+
+    /* Using :global to prevent Svelte from purging this dynamically added class */
+    :global(.scroll-highlight) {
+        animation: highlight-pulse 2s ease-in-out;
+    }
+
+    @keyframes highlight-pulse {
+        0% {
+            box-shadow: 0 0 0 0 rgba(212, 175, 55, 0);
+        }
+        20% {
+            box-shadow: 0 0 0 0 rgba(212, 175, 55, 0.6);
+        }
+        50% {
+            box-shadow: 0 0 0 10px rgba(212, 175, 55, 0);
+            background-color: rgba(212, 175, 55, 0.1);
+        }
+        100% {
+            box-shadow: 0 0 0 0 rgba(212, 175, 55, 0);
+        }
     }
 
     .sku-label {
