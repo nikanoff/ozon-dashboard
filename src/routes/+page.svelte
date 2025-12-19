@@ -9,7 +9,7 @@
         "ozon-dashboard",
         async () => {
             const thirtyOneDaysAgo = new Date(
-                Date.now() - 31 * 24 * 60 * 1000,
+                Date.now() - 31 * 24 * 60 * 60 * 1000,
             ).toISOString();
 
             const postingsResponse = await getFboPostings(
@@ -158,11 +158,6 @@
     };
 
     $: if (postingsData) {
-        console.log(
-            "[Dashboard] Recalculating stats for",
-            postingsData.length,
-            "postings",
-        );
         calculateStats();
     }
 
@@ -183,7 +178,9 @@
             netSum: 0,
             crossCluster: 0,
         });
-        stats = {
+
+        // Use local variable for calculation to avoid premature reactivity updates
+        const newStats = {
             last24h: createEmptyStat(),
             last7d: createEmptyStat(),
             last31d: createEmptyStat(),
@@ -205,54 +202,60 @@
         startOfWeek.setDate(now.getDate() - day + (day === 0 ? -6 : 1));
         startOfWeek.setHours(0, 0, 0, 0);
 
+        const limit24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        const limit7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const limit31d = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
+
         const periods = [
-            { key: "last24h", limit: 24 * 60 * 60 * 1000, type: "rolling" },
-            { key: "last7d", limit: 7 * 24 * 60 * 60 * 1000, type: "rolling" },
-            {
-                key: "last31d",
-                limit: 31 * 24 * 60 * 60 * 1000,
-                type: "rolling",
-            },
-            { key: "calendarDay", limit: startOfDay, type: "calendar" },
-            { key: "calendarWeek", limit: startOfWeek, type: "calendar" },
-            { key: "calendarMonth", limit: startOfMonth, type: "calendar" },
+            { key: "last24h", limit: limit24h },
+            { key: "last7d", limit: limit7d },
+            { key: "last31d", limit: limit31d },
+            { key: "calendarDay", limit: startOfDay },
+            { key: "calendarWeek", limit: startOfWeek },
+            { key: "calendarMonth", limit: startOfMonth },
         ];
 
         postingsData.forEach((p: any) => {
-            const pDate = new Date(p.in_process_at || p.created_at);
+            // Use created_at for consistent sales statistics based on order time
+            const pDate = new Date(p.created_at);
             const price = (p.products || []).reduce(
                 (acc: number, prod: any) =>
                     acc + parseFloat(prod.price) * (prod.quantity || 1),
                 0,
             );
 
-            periods.forEach(({ key, limit, type }) => {
-                const isMatch =
-                    type === "rolling"
-                        ? now.getTime() - pDate.getTime() <= (limit as number)
-                        : pDate >= (limit as Date);
+            periods.forEach(({ key, limit }) => {
+                // Unified logic: Check if order date is after the limit threshold
+                const isMatch = pDate >= limit;
 
                 if (isMatch) {
-                    (stats as any)[key].count++;
-                    (stats as any)[key].sum += price;
+                    // Type assertion to access dynamic keys on defined structure
+                    const k = key as keyof typeof newStats;
+                    newStats[k].count++;
+                    newStats[k].sum += price;
+
                     if (p.status === "cancelled") {
-                        (stats as any)[key].cancelled++;
-                        (stats as any)[key].cancelledSum += price;
+                        newStats[k].cancelled++;
+                        newStats[k].cancelledSum += price;
                     }
+
                     if (
                         p.financial_data?.cluster_from &&
                         p.financial_data?.cluster_to &&
                         p.financial_data.cluster_from !==
                             p.financial_data.cluster_to
                     ) {
-                        (stats as any)[key].crossCluster++;
+                        newStats[k].crossCluster++;
                     }
-                    (stats as any)[key].netSum =
-                        (stats as any)[key].sum -
-                        (stats as any)[key].cancelledSum;
+
+                    newStats[k].netSum =
+                        newStats[k].sum - newStats[k].cancelledSum;
                 }
             });
         });
+
+        // Final assignment triggers reactivity once
+        stats = newStats;
     }
 
     $: statsConfig = [

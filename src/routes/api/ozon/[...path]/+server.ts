@@ -28,6 +28,7 @@ export const POST: RequestHandler = async ({ request, params, url }) => {
 
 
         const data = await response.json();
+
         return json(data, { status: response.status });
     } catch (error) {
         console.error('Ozon API proxy error:', error);

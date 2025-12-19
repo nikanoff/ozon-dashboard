@@ -32,7 +32,7 @@ export async function getStocks() {
 
 export async function getFboPostings(since: string, to: string) {
     return callOzon('/v2/posting/fbo/list', {
-        dir: 'ASC',
+        dir: 'DESC',
         filter: {
             since: since,
             to: to,
@@ -40,6 +40,7 @@ export async function getFboPostings(since: string, to: string) {
         },
         limit: 1000,
         offset: 0,
+        translit: true,
         with: {
             analytics_data: true,
             financial_data: true

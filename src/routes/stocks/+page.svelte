@@ -850,6 +850,18 @@
         animation-delay: 1.8s;
     }
 
+    @keyframes sway {
+        0% {
+            transform: rotate(-6deg);
+        }
+        50% {
+            transform: rotate(6deg);
+        }
+        100% {
+            transform: rotate(-6deg);
+        }
+    }
+
     @keyframes sparkle-anim {
         0%,
         100% {
