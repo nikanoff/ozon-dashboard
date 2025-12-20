@@ -231,12 +231,13 @@
                 if (isMatch) {
                     // Type assertion to access dynamic keys on defined structure
                     const k = key as keyof typeof newStats;
-                    newStats[k].count++;
                     newStats[k].sum += price;
 
                     if (p.status === "cancelled") {
                         newStats[k].cancelled++;
                         newStats[k].cancelledSum += price;
+                    } else {
+                        newStats[k].count++;
                     }
 
                     if (
@@ -464,59 +465,217 @@
     {/if}
 
     <section class="stats-section">
-        <h2 class="section-title">FBO Postings Statistics</h2>
-        <div class="stats-grid">
-            {#each statsConfig as config (config.label)}
-                <div class="stat-card">
-                    <div class="stat-header">
-                        <div
-                            class="stat-icon-pod"
-                            style="background: {config.color}1a; color: {config.color}"
-                        >
-                            <svg
-                                viewBox="0 0 24 24"
-                                width="18"
-                                height="18"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                            >
-                                {@html config.icon}
-                            </svg>
-                        </div>
-                        <span class="stat-label">{config.label}</span>
-                    </div>
+        <div class="bento-header">
+            <h2 class="section-title">Performance Analytics</h2>
+        </div>
 
-                    <div class="stat-values">
-                        <div class="stat-main">
-                            <span class="stat-count"
-                                >{config.value.count} orders</span
+        <div class="bento-grid">
+            <!-- Hero Card: Calendar Day -->
+            <div class="bento-card hero-card glass-panel glow-effect">
+                <div class="card-content">
+                    <div class="card-header">
+                        <span class="bento-label">Calendar Day</span>
+                        <span class="live-indicator"></span>
+                    </div>
+                    <div class="card-main-value">
+                        <span class="currency-symbol">₽</span>
+                        <!-- Main: Net Sales (Total with cancellations) -->
+                        <span class="diamond-text text-xl"
+                            >{formatCurrency(stats.calendarDay.netSum)
+                                .replace("₽", "")
+                                .trim()}</span
+                        >
+                        <div class="main-label">Net Sales</div>
+                    </div>
+                    <div class="card-sub-stats">
+                        <div class="sub-stat">
+                            <span class="sub-label">Gross Sales</span>
+                            <span class="sub-value"
+                                >{formatCurrency(stats.calendarDay.sum)}</span
                             >
-                            {#if config.value.cancelled > 0}
-                                <span class="stat-cancelled">
-                                    {config.value.cancelled} cancelled ({formatCurrency(
-                                        config.value.cancelledSum,
+                        </div>
+                        <div class="separator"></div>
+                        <div class="sub-stat">
+                            <span class="sub-label">Orders</span>
+                            <span class="sub-value"
+                                >{stats.calendarDay.count}</span
+                            >
+                        </div>
+                        {#if stats.calendarDay.cancelled > 0}
+                            <div class="separator"></div>
+                            <div class="sub-stat">
+                                <span class="sub-label text-error"
+                                    >Cancelled</span
+                                >
+                                <span class="sub-value text-error">
+                                    {stats.calendarDay.cancelled} ({formatCurrency(
+                                        stats.calendarDay.cancelledSum,
                                     )})
                                 </span>
-                            {/if}
-                            <span class="stat-total-label"
-                                >Total: {formatCurrency(config.value.sum)}</span
-                            >
-                            {#if config.value.crossCluster > 0}
-                                <span class="stat-cross-cluster">
-                                    {config.value.crossCluster} inter-cluster movements
-                                </span>
-                            {/if}
-                        </div>
-                        <div class="stat-net">
-                            <span class="stat-sum"
-                                >{formatCurrency(config.value.netSum)}</span
-                            >
-                            <span class="net-label">Net Sales</span>
-                        </div>
+                            </div>
+                        {/if}
                     </div>
                 </div>
-            {/each}
+            </div>
+
+            <!-- Medium Card: Calendar Week -->
+            <div class="bento-card medium-card glass-panel">
+                <div class="card-content">
+                    <span class="bento-label">Calendar Week</span>
+                    <div class="card-value-group">
+                        <!-- Main: Net Sales -->
+                        <span class="diamond-text text-lg"
+                            >{formatCurrency(stats.calendarWeek.netSum)
+                                .replace("₽", "")
+                                .trim()}</span
+                        >
+                        <span class="unit">₽</span>
+                    </div>
+                    <div class="mini-stat-col">
+                        <div class="mini-row">
+                            <span class="mini-label">Orders:</span>
+                            <span class="mini-value"
+                                >{stats.calendarWeek.count}</span
+                            >
+                        </div>
+                        <div class="mini-row">
+                            <span class="mini-label">Gross:</span>
+                            <span class="mini-value"
+                                >{formatCurrency(stats.calendarWeek.sum)}</span
+                            >
+                        </div>
+                        {#if stats.calendarWeek.cancelled > 0}
+                            <div class="mini-row">
+                                <span class="mini-label text-error"
+                                    >Cancelled:</span
+                                >
+                                <span class="mini-value text-error">
+                                    {stats.calendarWeek.cancelled} ({formatCurrency(
+                                        stats.calendarWeek.cancelledSum,
+                                    )})
+                                </span>
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Medium Card: Calendar Month -->
+            <div class="bento-card medium-card glass-panel">
+                <div class="card-content">
+                    <span class="bento-label">Calendar Month</span>
+                    <div class="card-value-group">
+                        <span class="diamond-text text-lg"
+                            >{formatCurrency(stats.calendarMonth.netSum)
+                                .replace("₽", "")
+                                .trim()}</span
+                        >
+                        <span class="unit">₽</span>
+                    </div>
+                    <div class="mini-stat-col">
+                        <div class="mini-row">
+                            <span class="mini-label">Orders:</span>
+                            <span class="mini-value"
+                                >{stats.calendarMonth.count}</span
+                            >
+                        </div>
+                        <div class="mini-row">
+                            <span class="mini-label">Gross:</span>
+                            <span class="mini-value"
+                                >{formatCurrency(stats.calendarMonth.sum)}</span
+                            >
+                        </div>
+                        {#if stats.calendarMonth.cancelled > 0}
+                            <div class="mini-row">
+                                <span class="mini-label text-error"
+                                    >Cancelled:</span
+                                >
+                                <span class="mini-value text-error">
+                                    {stats.calendarMonth.cancelled} ({formatCurrency(
+                                        stats.calendarMonth.cancelledSum,
+                                    )})
+                                </span>
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Small Cards (Optimized for space) -->
+            <div class="bento-card small-card glass-panel">
+                <span class="bento-label small">Last 24 Hours</span>
+                <div class="small-value">
+                    <span class="diamond-text text-md"
+                        >{formatCurrency(stats.last24h.netSum)
+                            .replace("₽", "")
+                            .trim()}</span
+                    >
+                </div>
+                <div class="micro-stat-group">
+                    <div class="micro-stat">
+                        Orders: {stats.last24h.count}
+                    </div>
+                    <div class="micro-stat">
+                        Gross: {formatCurrency(stats.last24h.sum)}
+                    </div>
+                    {#if stats.last24h.cancelled > 0}
+                        <div class="micro-stat text-error">
+                            -{formatCurrency(stats.last24h.cancelledSum)} ({stats
+                                .last24h.cancelled})
+                        </div>
+                    {/if}
+                </div>
+            </div>
+
+            <div class="bento-card small-card glass-panel">
+                <span class="bento-label small">Last 7 Days</span>
+                <div class="small-value">
+                    <span class="diamond-text text-md"
+                        >{formatCurrency(stats.last7d.netSum)
+                            .replace("₽", "")
+                            .trim()}</span
+                    >
+                </div>
+                <div class="micro-stat-group">
+                    <div class="micro-stat">
+                        Orders: {stats.last7d.count}
+                    </div>
+                    <div class="micro-stat">
+                        Gross: {formatCurrency(stats.last7d.sum)}
+                    </div>
+                    {#if stats.last7d.cancelled > 0}
+                        <div class="micro-stat text-error">
+                            -{formatCurrency(stats.last7d.cancelledSum)} ({stats
+                                .last7d.cancelled})
+                        </div>
+                    {/if}
+                </div>
+            </div>
+
+            <div class="bento-card small-card glass-panel">
+                <span class="bento-label small">Last 31 Days</span>
+                <div class="small-value">
+                    <span class="diamond-text text-md"
+                        >{formatCurrency(stats.last31d.netSum)
+                            .replace("₽", "")
+                            .trim()}</span
+                    >
+                </div>
+                <div class="micro-stat-group">
+                    <div class="micro-stat">
+                        Orders: {stats.last31d.count}
+                    </div>
+                    <div class="micro-stat">
+                        Gross: {formatCurrency(stats.last31d.sum)}
+                    </div>
+                    {#if stats.last31d.cancelled > 0}
+                        <div class="micro-stat text-error">
+                            -{formatCurrency(stats.last31d.cancelledSum)} ({stats
+                                .last31d.cancelled})
+                        </div>
+                    {/if}
+                </div>
+            </div>
         </div>
     </section>
 
@@ -1212,114 +1371,282 @@
         opacity: 0.9;
     }
 
-    .stats-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: var(--space-md);
-    }
-
-    .stat-card {
-        background: var(--bg-card);
-        padding: var(--space-lg);
-        border: 1px solid var(--border-subtle);
-        border-radius: var(--radius-md);
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-md);
-        transition: all 0.3s ease;
-    }
-
-    .stat-card:hover {
-        border-color: var(--border-hover);
-        background: var(--bg-elevated);
-    }
-
-    .stat-header {
+    /* Bento Grid System */
+    .bento-header {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 1rem;
+        margin-bottom: var(--space-lg);
     }
 
-    .stat-icon-pod {
-        width: 28px;
-        height: 28px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        opacity: 0.4;
-    }
-
-    .stat-label {
-        font-size: 0.6rem;
-        color: var(--text-muted);
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.2em;
-    }
-
-    .stat-values {
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-md);
-    }
-
-    .stat-main {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-    }
-
-    .stat-count {
-        font-family: var(--font-heading);
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: var(--text-primary);
-        letter-spacing: 0.02em;
-    }
-
-    .stat-total-label {
-        font-size: 0.65rem;
-        color: var(--text-muted);
-    }
-
-    .stat-cancelled {
-        font-size: 0.65rem;
-        color: #ef4444; /* Red for emphasis on cancelled */
-        font-weight: 500;
-        opacity: 0.8;
-    }
-
-    .stat-cross-cluster {
-        font-size: 0.6rem;
-        color: #d4af37; /* Match ornament color for inter-cluster */
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-top: 4px;
-    }
-
-    .stat-net {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        border-top: 1px solid var(--border-subtle);
-        padding-top: var(--space-md);
-    }
-
-    .stat-sum {
+    .section-title {
         font-family: var(--font-heading);
         font-size: 1.25rem;
-        font-weight: 700;
         color: var(--text-primary);
-        letter-spacing: -0.01em;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        margin: 0;
     }
 
-    .net-label {
-        font-size: 0.55rem;
+    .bento-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-rows: repeat(2, minmax(160px, auto)) minmax(120px, auto);
+        gap: 16px;
+        grid-template-areas:
+            "hero hero week"
+            "hero hero month"
+            "small1 small2 small3";
+    }
+
+    @media (max-width: 1024px) {
+        .bento-grid {
+            grid-template-columns: 1fr 1fr;
+            grid-template-areas:
+                "hero hero"
+                "week month"
+                "small1 small2"
+                "small3 small3";
+        }
+    }
+
+    @media (max-width: 768px) {
+        .bento-grid {
+            display: flex;
+            flex-direction: column;
+        }
+        .hero-card {
+            min-height: 200px;
+        }
+    }
+
+    .bento-card {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        padding: var(--space-lg);
+        overflow: hidden;
+        transition:
+            transform 0.3s ease,
+            box-shadow 0.3s ease;
+    }
+
+    .bento-card:hover {
+        transform: translateY(-2px);
+    }
+
+    .glass-panel {
+        background: rgba(20, 20, 20, 0.4);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.08); /* 0.5px visual feel */
+        border-radius: 20px;
+        box-shadow: 0 4px 24px -1px rgba(0, 0, 0, 0.2);
+    }
+
+    /* Areas */
+    .hero-card {
+        grid-area: hero;
+    }
+    .bento-grid > div:nth-child(2) {
+        grid-area: week;
+    }
+    .bento-grid > div:nth-child(3) {
+        grid-area: month;
+    }
+    .bento-grid > div:nth-child(4) {
+        grid-area: small1;
+    }
+    .bento-grid > div:nth-child(5) {
+        grid-area: small2;
+    }
+    .bento-grid > div:nth-child(6) {
+        grid-area: small3;
+    }
+
+    /* Hero Styling */
+    .glow-effect {
+        background: radial-gradient(
+                circle at top right,
+                rgba(212, 175, 55, 0.05),
+                transparent 60%
+            ),
+            rgba(20, 20, 20, 0.6);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        box-shadow:
+            0 0 40px -10px rgba(0, 0, 0, 0.5),
+            inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    }
+
+    .card-content {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        position: relative;
+        z-index: 2;
+    }
+
+    .hero-card .card-content {
+        justify-content: space-between;
+    }
+
+    .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+    }
+
+    .bento-label {
+        font-family: var(--font-heading);
+        font-size: 0.75rem;
         text-transform: uppercase;
-        letter-spacing: 0.2em;
+        letter-spacing: 0.15em;
+        color: var(--accent-gold);
+        opacity: 0.9;
+        font-weight: 600;
+    }
+
+    .bento-label.small {
+        font-size: 0.65rem;
         color: var(--text-muted);
-        margin-top: 6px;
+        margin-bottom: auto;
+    }
+
+    .live-indicator {
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        background: #10b981;
+        border-radius: 50%;
+        box-shadow: 0 0 8px #10b981;
+    }
+
+    /* Typography & Diamond Effect */
+    .diamond-text {
+        font-family: var(--font-heading);
+        font-weight: 700;
+        color: #fff;
+        letter-spacing: -0.02em;
+
+        /* Cold Diamond Gradient */
+        background: linear-gradient(180deg, #ffffff 20%, #eff6ff 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-shadow: 0 2px 10px rgba(255, 255, 255, 0.15);
+    }
+
+    .text-xl {
+        font-size: clamp(2.5rem, 4vw, 4.5rem);
+        line-height: 1;
+    }
+    .text-lg {
+        font-size: clamp(1.5rem, 2vw, 2.5rem);
+        line-height: 1.1;
+    }
+    .text-md {
+        font-size: 1.5rem;
+        line-height: 1.2;
+    }
+
+    .currency-symbol {
+        font-size: 1.5rem;
+        color: var(--text-muted);
+        vertical-align: top;
+        margin-right: 4px;
+        font-weight: 400;
+        opacity: 0.5;
+    }
+
+    .unit {
+        font-size: 0.875rem;
+        color: var(--text-muted);
+        opacity: 0.5;
+        margin-left: 4px;
+    }
+
+    .card-main-value {
+        margin: var(--space-md) 0;
+    }
+
+    .card-sub-stats {
+        display: flex;
+        align-items: center;
+        gap: var(--space-md);
+        padding-top: var(--space-md);
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .sub-stat {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .sub-label {
+        font-size: 0.6rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--text-muted);
+    }
+
+    .sub-value {
+        font-family: var(--font-body);
+        font-size: 0.9rem;
+        color: var(--text-secondary);
+        font-weight: 500;
+    }
+
+    .separator {
+        width: 1px;
+        height: 24px;
+        background: rgba(255, 255, 255, 0.1);
+    }
+
+    .gold-text {
+        color: var(--accent-gold);
+    }
+
+    .white-text {
+        color: var(--text-primary);
+    }
+
+    .text-error {
+        color: var(--error);
+    }
+
+    /* Medium & Small specific */
+    .medium-card .card-content {
+        justify-content: space-between;
+    }
+
+    .card-value-group {
+        margin: auto 0;
+    }
+
+    .mini-stat-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        padding-top: 12px;
+    }
+
+    .small-card {
+        align-items: flex-start;
+        padding: var(--space-md);
+    }
+
+    .small-value {
+        margin-top: 8px;
+        margin-bottom: 4px;
+    }
+
+    .micro-stat {
+        font-size: 0.7rem;
+        color: var(--text-muted);
     }
 
     /* Christmas Decoration Styling */

@@ -5,13 +5,13 @@
     --font-body: "Plus Jakarta Sans", sans-serif;
 
     /* Modern Dark Palette - Vercel/Linear Inspired */
-    --bg-main: #0a0a0a;
-    --bg-card: #141414;
-    --bg-elevated: #1a1a1a;
+    --bg-main: #000000;
+    --bg-card: #09090b;
+    --bg-elevated: #18181b;
 
-    --border-subtle: #1f1f1f;
-    --border-hover: #333333;
-    --border-bold: #444444;
+    --border-subtle: #27272a;
+    --border-hover: #3f3f46;
+    --border-bold: #52525b;
 
     --text-primary: #ffffff;
     --text-secondary: #a1a1aa;
