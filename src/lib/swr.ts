@@ -3,6 +3,7 @@ import { writable, type Writable } from 'svelte/store';
 export interface SWROptions<T> {
     dedupingInterval?: number;
     revalidateOnFocus?: boolean;
+    refreshInterval?: number;  // Auto-refresh interval in ms (0 = disabled)
     initialData?: T;
 }
 
@@ -27,6 +28,7 @@ export function useSWR<T>(
     const {
         dedupingInterval = 5000,
         revalidateOnFocus = true,
+        refreshInterval = 0,
         initialData
     } = options;
 
@@ -63,6 +65,17 @@ export function useSWR<T>(
 
     // Revalidate on focus - with proper cleanup to prevent memory leaks
     let dispose: (() => void) | undefined = undefined;
+    let refreshIntervalId: ReturnType<typeof setInterval> | undefined = undefined;
+
+    // Setup refresh interval if specified
+    if (refreshInterval > 0 && typeof window !== 'undefined') {
+        refreshIntervalId = setInterval(() => {
+            console.log(`[SWR] Auto-refreshing data for key: ${key}`);
+            mutate();
+        }, refreshInterval);
+        console.log(`[SWR] Started refresh interval (${refreshInterval}ms) for key: ${key}`);
+    }
+
     if (revalidateOnFocus && typeof window !== 'undefined') {
         const handleFocus = () => {
             console.log(`[SWR] Revalidating on focus for key: ${key}`);
@@ -80,6 +93,18 @@ export function useSWR<T>(
                 window.removeEventListener('focus', listener);
                 focusListeners.delete(key);
                 console.log(`[SWR] Removed focus listener for key: ${key}`);
+            }
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+                console.log(`[SWR] Cleared refresh interval for key: ${key}`);
+            }
+        };
+    } else if (refreshIntervalId) {
+        // If no focus listener but we have an interval, still need dispose
+        dispose = () => {
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+                console.log(`[SWR] Cleared refresh interval for key: ${key}`);
             }
         };
     }

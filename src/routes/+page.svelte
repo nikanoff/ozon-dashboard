@@ -62,7 +62,7 @@
                 skuToImage,
             };
         },
-        { dedupingInterval: 2000 },
+        { dedupingInterval: 2000, refreshInterval: 60000 },
     );
 
     const {
@@ -74,6 +74,19 @@
         dispose,
     } = swrResult;
 
+    // Dynamic title for browser tab with calendarDay value
+    let pageTitle = "Ozon Seller Dashboard | Аналитика продаж";
+
+    function updatePageTitle() {
+        const netSum = stats.calendarDay.netSum;
+        if (netSum > 0) {
+            const formatted = formatCurrency(netSum).replace("₽", "").trim();
+            pageTitle = `${formatted} ₽ сегодня | Ozon Dashboard`;
+        } else {
+            pageTitle = "Ozon Seller Dashboard | Аналитика продаж";
+        }
+    }
+
     // Clean up resources when component is destroyed
     onDestroy(() => {
         console.log(
@@ -83,6 +96,11 @@
             dispose();
         }
     });
+
+    // Update title when stats change (reactive)
+    $: if (stats.calendarDay.netSum >= 0) {
+        updatePageTitle();
+    }
 
     // Refresh data when keys change
     $: if ($ozonKeys.clientId || $ozonKeys.apiKey) {
@@ -300,7 +318,7 @@
 </script>
 
 <svelte:head>
-    <title>Ozon Seller Dashboard | Аналитика продаж</title>
+    <title>{pageTitle}</title>
     <meta
         name="description"
         content="Дашборд продавца Ozon. Статистика заказов, аналитика продаж за 24 часа, 7 и 31 день."
