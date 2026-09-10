@@ -38,31 +38,61 @@ function makeError(response: Response, payload: unknown): OzonApiError {
     return error;
 }
 
-export async function callOzon(path: string, body: any) {
-    const keys = get(ozonKeys);
+// Ozon enforces per-method rate limits (e.g. `/v2/posting/fbo/list` answers with
+// `Retry-After: 1` when called too often). Firing several Ozon calls at once
+// trips those limits, so all requests are serialised through this chain: each
+// call waits for the previous one to settle before it starts.
+let requestChain: Promise<unknown> = Promise.resolve();
 
-    const response = await fetch(`/api/ozon${path}`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Ozon-Client-Id': keys.clientId,
-            'X-Ozon-Api-Key': keys.apiKey
-        },
-        body: JSON.stringify(body)
+// Minimum spacing between two consecutive Ozon requests.
+const REQUEST_GAP_MS = 1000;
+
+function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRateLimitGate<T>(task: () => Promise<T>): Promise<T> {
+    const run = requestChain.then(async () => {
+        const result = await task();
+        // Space out requests even on success to stay below per-second limits.
+        await delay(REQUEST_GAP_MS);
+        return result;
     });
 
-    let payload: unknown = null;
-    try {
-        payload = await response.json();
-    } catch {
-        payload = null;
-    }
+    // Keep the chain alive even when a request rejects, otherwise every later
+    // call would immediately fail with the same error.
+    requestChain = run.catch(() => undefined);
 
-    if (!response.ok) {
-        throw makeError(response, payload);
-    }
+    return run;
+}
 
-    return payload;
+export async function callOzon(path: string, body: any) {
+    return withRateLimitGate(async () => {
+        const keys = get(ozonKeys);
+
+        const response = await fetch(`/api/ozon${path}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Ozon-Client-Id': keys.clientId,
+                'X-Ozon-Api-Key': keys.apiKey
+            },
+            body: JSON.stringify(body)
+        });
+
+        let payload: unknown = null;
+        try {
+            payload = await response.json();
+        } catch {
+            payload = null;
+        }
+
+        if (!response.ok) {
+            throw makeError(response, payload);
+        }
+
+        return payload;
+    });
 }
 
 export async function getStocks() {

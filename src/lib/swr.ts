@@ -28,10 +28,15 @@ const blockedUntil = new Map<string, number>();
 const MAX_BACKOFF_MS = 5 * 60 * 1000;  // Cap automatic retries at 5 minutes
 const DEFAULT_BACKOFF_MS = 60 * 1000;  // Fallback when Retry-After is absent
 
+// Ozon often answers with `Retry-After: 1` for per-second limits. Honouring that
+// literally just makes the next request fail again, so we never pause for less
+// than this.
+const MIN_BACKOFF_MS = 30 * 1000;
+
 function backoffDelay(error: any, attempt: number): number {
     const retryAfter = Number((error as OzonApiError)?.retryAfterMs);
     if (Number.isFinite(retryAfter) && retryAfter > 0) {
-        return Math.min(retryAfter, MAX_BACKOFF_MS);
+        return Math.min(Math.max(retryAfter, MIN_BACKOFF_MS), MAX_BACKOFF_MS);
     }
     // Exponential backoff for repeated failures without a Retry-After hint.
     return Math.min(DEFAULT_BACKOFF_MS * 2 ** Math.max(0, attempt - 1), MAX_BACKOFF_MS);
