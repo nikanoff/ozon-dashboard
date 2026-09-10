@@ -10,13 +10,21 @@ export interface OzonApiError extends Error {
 }
 
 function makeError(response: Response, payload: unknown): OzonApiError {
-    const retryAfter = Number(response.headers.get('Retry-After'));
+    // Ozon sends the wait time as `Item-Retry-After`; fall back to the standard
+    // `Retry-After` for gateways/proxies that normalise it.
+    const retryAfterHeader =
+        response.headers.get('Item-Retry-After') ?? response.headers.get('Retry-After');
+    const retryAfter = Number(retryAfterHeader);
     const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0;
 
-    let message = (payload as any)?.message;
+    const remaining = (payload as any)?.message;
+    let message = remaining;
     if (!message) {
         if (response.status === 429) {
-            const wait = retryAfterMs > 0 ? ` Повторите через ${Math.ceil(retryAfterMs / 1000)} с.` : '';
+            const wait =
+                retryAfterMs > 0
+                    ? ` Повторите через ${Math.ceil(retryAfterMs / 1000)} с.`
+                    : '';
             message = `Превышен лимит запросов Ozon (429).${wait}`;
         } else {
             message = `Ozon API error: ${response.status} ${response.statusText}`;

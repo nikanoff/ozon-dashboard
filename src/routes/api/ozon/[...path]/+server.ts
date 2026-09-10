@@ -3,12 +3,15 @@ import type { RequestHandler } from './$types';
 import { OZON_CLIENT_ID, OZON_API_KEY, OZON_BASE_URL } from '$lib/ozon_config';
 
 // Headers returned by Ozon that describe the current rate limits.
-// We forward them so the client can back off intelligently.
+// Ozon uses non-standard names (Item-Retry-After / Item-Rate-Limit-Remaining),
+// so we forward both those and the conventional spellings.
 const RATE_LIMIT_HEADERS = [
     'retry-after',
+    'item-retry-after',
     'x-ratelimit-limit',
     'x-ratelimit-remaining',
-    'x-ratelimit-reset'
+    'x-ratelimit-reset',
+    'item-rate-limit-remaining'
 ];
 
 export const POST: RequestHandler = async ({ request, url }) => {
