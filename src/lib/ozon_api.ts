@@ -38,24 +38,62 @@ function makeError(response: Response, payload: unknown): OzonApiError {
     return error;
 }
 
-// Ozon enforces per-method rate limits (e.g. `/v2/posting/fbo/list` answers with
-// `Retry-After: 1` when called too often). Firing several Ozon calls at once
-// trips those limits, so all requests are serialised through this chain: each
-// call waits for the previous one to settle before it starts.
+// Ozon enforces per-method rate limits. `/v2/posting/fbo/list` answers with
+// `429 code:8 "You have reached request rate limit per second"` when called too
+// often, and a 1s gap sits exactly on the edge of that limit. We use a wider gap
+// and serialise requests globally (see below).
+const REQUEST_GAP_MS = 3000;
+
+// All requests from this tab are chained: each one starts only after the
+// previous settles, so the dashboard never fires Ozon calls in parallel.
 let requestChain: Promise<unknown> = Promise.resolve();
 
-// Minimum spacing between two consecutive Ozon requests.
-const REQUEST_GAP_MS = 1000;
+// Requests are serialised per browser via localStorage so that multiple open
+// tabs share one queue instead of each hammering Ozon independently.
+const GATE_KEY = 'ozon_request_gate';
+const GATE_STALE_MS = 60 * 1000;
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Waits until no other tab has used the API within the last REQUEST_GAP_MS.
+ *
+ * The timestamp is kept in localStorage and claimed with a "reservation" that
+ * is written before the wait, so two tabs cannot both pass the check at once.
+ */
+async function waitForGlobalSlot(): Promise<void> {
+    if (typeof localStorage === 'undefined') {
+        return;
+    }
+
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+        const now = Date.now();
+        const lastUsed = Number(localStorage.getItem(GATE_KEY)) || 0;
+        const elapsed = now - lastUsed;
+
+        // Treat an implausibly old timestamp as "free" so a crashed tab that
+        // left a reservation behind cannot block the gate forever.
+        if (elapsed < 0 || elapsed > GATE_STALE_MS) {
+            localStorage.setItem(GATE_KEY, String(now));
+            return;
+        }
+
+        if (elapsed >= REQUEST_GAP_MS) {
+            // Reserve the slot before returning so another tab sees the update.
+            localStorage.setItem(GATE_KEY, String(now));
+            return;
+        }
+
+        await delay(REQUEST_GAP_MS - elapsed);
+    }
+}
+
 async function withRateLimitGate<T>(task: () => Promise<T>): Promise<T> {
     const run = requestChain.then(async () => {
+        await waitForGlobalSlot();
         const result = await task();
-        // Space out requests even on success to stay below per-second limits.
-        await delay(REQUEST_GAP_MS);
         return result;
     });
 
