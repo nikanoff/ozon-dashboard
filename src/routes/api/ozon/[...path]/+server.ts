@@ -2,12 +2,27 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { OZON_CLIENT_ID, OZON_API_KEY, OZON_BASE_URL } from '$lib/ozon_config';
 
-export const POST: RequestHandler = async ({ request, params, url }) => {
+// Headers returned by Ozon that describe the current rate limits.
+// We forward them so the client can back off intelligently.
+const RATE_LIMIT_HEADERS = [
+    'retry-after',
+    'x-ratelimit-limit',
+    'x-ratelimit-remaining',
+    'x-ratelimit-reset'
+];
+
+export const POST: RequestHandler = async ({ request, url }) => {
     // Extract the path from the URL, removing the '/api/ozon' prefix
     const path = url.pathname.replace('/api/ozon', '');
     const targetUrl = `${OZON_BASE_URL}${path}`;
 
-    const body = await request.json();
+    let body: unknown = {};
+    try {
+        body = await request.json();
+    } catch {
+        // Some Ozon methods accept an empty body; fall back to an empty object.
+        body = {};
+    }
 
     const headerClientId = request.headers.get('X-Ozon-Client-Id');
     const headerApiKey = request.headers.get('X-Ozon-Api-Key');
@@ -15,8 +30,16 @@ export const POST: RequestHandler = async ({ request, params, url }) => {
     const clientId = headerClientId !== null ? headerClientId : OZON_CLIENT_ID;
     const apiKey = headerApiKey !== null ? headerApiKey : OZON_API_KEY;
 
+    if (!clientId || !apiKey) {
+        return json(
+            { code: 16, message: 'Client-Id and Api-Key headers are required' },
+            { status: 401 }
+        );
+    }
+
+    let response: Response;
     try {
-        const response = await fetch(targetUrl, {
+        response = await fetch(targetUrl, {
             method: 'POST',
             headers: {
                 'Client-Id': clientId,
@@ -25,13 +48,37 @@ export const POST: RequestHandler = async ({ request, params, url }) => {
             },
             body: JSON.stringify(body)
         });
-
-
-        const data = await response.json();
-
-        return json(data, { status: response.status });
     } catch (error) {
-        console.error('Ozon API proxy error:', error);
-        return json({ error: 'Internal Server Error' }, { status: 500 });
+        // `fetch` throws a generic "fetch failed" for network/TLS errors. The real
+        // cause (e.g. certificate problems) is hidden in `error.cause`, so log it.
+        console.error('Ozon API proxy request failed:', error, (error as any)?.cause);
+        return json(
+            { error: 'Failed to reach Ozon API', detail: String((error as any)?.cause ?? error) },
+            { status: 502 }
+        );
     }
+
+    // Ozon may answer with an empty body or HTML (e.g. on gateway errors), so we
+    // can't assume JSON. Read the text first and parse defensively.
+    const raw = await response.text();
+    let data: unknown;
+    try {
+        data = raw ? JSON.parse(raw) : {};
+    } catch {
+        data = { error: 'Unexpected non-JSON response from Ozon API', raw: raw.slice(0, 500) };
+    }
+
+    const headers = new Headers();
+    for (const name of RATE_LIMIT_HEADERS) {
+        const value = response.headers.get(name);
+        if (value !== null) {
+            headers.set(name, value);
+        }
+    }
+
+    if (response.status === 429) {
+        console.warn('Ozon API rate limit hit (429) for', path);
+    }
+
+    return json(data, { status: response.status, headers });
 };

@@ -1,6 +1,35 @@
 import { get } from 'svelte/store';
 import { ozonKeys } from './stores/ozon_keys';
 
+export interface OzonApiError extends Error {
+    status: number;
+    /** Milliseconds to wait before retrying, derived from the Retry-After header. */
+    retryAfterMs: number;
+    /** Raw response body from the proxy, if available. */
+    payload: unknown;
+}
+
+function makeError(response: Response, payload: unknown): OzonApiError {
+    const retryAfter = Number(response.headers.get('Retry-After'));
+    const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0;
+
+    let message = (payload as any)?.message;
+    if (!message) {
+        if (response.status === 429) {
+            const wait = retryAfterMs > 0 ? ` Повторите через ${Math.ceil(retryAfterMs / 1000)} с.` : '';
+            message = `Превышен лимит запросов Ozon (429).${wait}`;
+        } else {
+            message = `Ozon API error: ${response.status} ${response.statusText}`;
+        }
+    }
+
+    const error = new Error(message) as OzonApiError;
+    error.status = response.status;
+    error.retryAfterMs = retryAfterMs;
+    error.payload = payload;
+    return error;
+}
+
 export async function callOzon(path: string, body: any) {
     const keys = get(ozonKeys);
 
@@ -14,14 +43,19 @@ export async function callOzon(path: string, body: any) {
         body: JSON.stringify(body)
     });
 
-    if (!response.ok) {
-        throw new Error(`Ozon API error: ${response.statusText}`);
+    let payload: unknown = null;
+    try {
+        payload = await response.json();
+    } catch {
+        payload = null;
     }
 
-    return await response.json();
+    if (!response.ok) {
+        throw makeError(response, payload);
+    }
+
+    return payload;
 }
-
-
 
 export async function getStocks() {
     return callOzon('/v4/product/info/stocks', {
