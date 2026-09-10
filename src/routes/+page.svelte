@@ -197,6 +197,21 @@
         }).format(value);
     }
 
+    /**
+     * Reads a product's unit price.
+     *
+     * The v3 API returns `price` as `{ amount, currency }`, while v2 used a plain
+     * string. Both shapes are accepted so totals never become NaN.
+     */
+    function productUnitPrice(product: any): number {
+        const raw =
+            typeof product?.price === "object" && product.price !== null
+                ? product.price.amount
+                : product?.price;
+        const value = parseFloat(raw);
+        return Number.isFinite(value) ? value : 0;
+    }
+
     function calculateStats() {
         const createEmptyStat = () => ({
             count: 0,
@@ -246,9 +261,11 @@
         postingsData.forEach((p: any) => {
             // Use created_at for consistent sales statistics based on order time
             const pDate = new Date(p.created_at);
+            // v3 returns `price` as an object ({ amount, currency }), while v2 used
+            // a plain string. Handle both so totals never collapse into NaN.
             const price = (p.products || []).reduce(
                 (acc: number, prod: any) =>
-                    acc + parseFloat(prod.price) * (prod.quantity || 1),
+                    acc + productUnitPrice(prod) * (prod.quantity || 1),
                 0,
             );
 
@@ -826,7 +843,7 @@
                                         </td>
                                         <td class="price-cell"
                                             >{formatCurrency(
-                                                parseFloat(product.price) *
+                                                productUnitPrice(product) *
                                                     product.quantity,
                                             )}</td
                                         >
