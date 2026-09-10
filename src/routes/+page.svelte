@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { getFboPostings, getProductInfoList } from "$lib/ozon_api";
+    import { getAllFboPostings, getProductInfoList } from "$lib/ozon_api";
     import { useSWR } from "$lib/swr";
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import OzonAuth from "$lib/components/OzonAuth.svelte";
@@ -12,12 +12,15 @@
                 Date.now() - 31 * 24 * 60 * 60 * 1000,
             ).toISOString();
 
-            const postingsResponse = await getFboPostings(
+            const postingsResponse = await getAllFboPostings(
                 thirtyOneDaysAgo,
                 new Date().toISOString(),
             ).catch(() => null);
 
-            const postings = postingsResponse?.result || [];
+            // v3 nests the items under `postings`; the v2 `result` key is kept as
+            // a fallback so the page tolerates either shape.
+            const postings =
+                postingsResponse?.postings || postingsResponse?.result || [];
 
             // Collect all unique SKUs from all products in all postings
             const allSkus = Array.from(

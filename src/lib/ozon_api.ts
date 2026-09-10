@@ -140,22 +140,78 @@ export async function getStocks() {
     });
 }
 
+/**
+ * Fetches FBO postings via the v3 method.
+ *
+ * The v2 method (`/v2/posting/fbo/list`) was disabled by Ozon on 1 June 2026 and
+ * now always answers `429 code:8`. v3 differs in several breaking ways: sorting
+ * uses `sort_dir`, pagination uses a `cursor` instead of `offset`, statuses are
+ * passed as an array, and the response nests items under `postings`.
+ */
 export async function getFboPostings(since: string, to: string) {
-    return callOzon('/v2/posting/fbo/list', {
-        dir: 'DESC',
+    return callOzon('/v3/posting/fbo/list', {
         filter: {
             since: since,
             to: to,
-            status: ''
+            statuses: [
+                'awaiting_packaging',
+                'awaiting_deliver',
+                'delivering',
+                'delivered',
+                'cancelled'
+            ]
         },
-        limit: 1000,
-        offset: 0,
+        limit: 100,
+        sort_dir: 'DESC',
         translit: true,
         with: {
             analytics_data: true,
             financial_data: true
         }
     });
+}
+
+/**
+ * Loads every page of FBO postings for the period by following the `cursor`
+ * returned by v3. The dashboard needs the full period for its statistics.
+ */
+export async function getAllFboPostings(since: string, to: string) {
+    const postings: any[] = [];
+    let cursor = '';
+
+    // Guard against a server that never reports `has_next: false`.
+    for (let page = 0; page < 50; page += 1) {
+        const response: any = await callOzon('/v3/posting/fbo/list', {
+            cursor,
+            filter: {
+                since,
+                to,
+                statuses: [
+                    'awaiting_packaging',
+                    'awaiting_deliver',
+                    'delivering',
+                    'delivered',
+                    'cancelled'
+                ]
+            },
+            limit: 100,
+            sort_dir: 'DESC',
+            translit: true,
+            with: {
+                analytics_data: true,
+                financial_data: true
+            }
+        });
+
+        postings.push(...(response?.postings || []));
+
+        if (!response?.has_next || !response?.cursor) {
+            break;
+        }
+        cursor = response.cursor;
+    }
+
+    return { postings, result: postings };
 }
 
 export async function getProductImages(productIds: string[]) {
