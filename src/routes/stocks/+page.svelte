@@ -78,7 +78,7 @@
                 imagesMap,
             };
         },
-        { dedupingInterval: 30000, refreshInterval: 300000 },
+        { dedupingInterval: 2000 },
     );
 
     const {
@@ -98,16 +98,9 @@
         }
     });
 
-    // Refresh data when the credentials actually change. We track the last used
-    // pair so loading them from localStorage (or unrelated store updates) does
-    // not trigger extra requests against Ozon's rate limits.
-    let lastKeys = "";
+    // Refresh data when keys change
     $: if ($ozonKeys.clientId || $ozonKeys.apiKey) {
-        const currentKeys = `${$ozonKeys.clientId}:${$ozonKeys.apiKey}`;
-        if (currentKeys !== lastKeys) {
-            lastKeys = currentKeys;
-            mutate();
-        }
+        mutate();
     }
 
     $: error = $swrError?.message || null;
