@@ -7,6 +7,14 @@ export interface PeriodStats {
     cancelledSum: number;
     netSum: number;
     crossCluster: number;
+    /** Units across every posting in the window (cancellations included). */
+    units: number;
+    /** Units sitting in cancelled postings. */
+    cancelledUnits: number;
+    /** `units` minus `cancelledUnits`. */
+    netUnits: number;
+    /** Posting count per Ozon status, cancellations included. */
+    byStatus: Record<string, number>;
 }
 
 export interface DashboardStats {
@@ -34,7 +42,18 @@ const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 
 function emptyPeriod(): PeriodStats {
-    return { count: 0, sum: 0, cancelled: 0, cancelledSum: 0, netSum: 0, crossCluster: 0 };
+    return {
+        count: 0,
+        sum: 0,
+        cancelled: 0,
+        cancelledSum: 0,
+        netSum: 0,
+        crossCluster: 0,
+        units: 0,
+        cancelledUnits: 0,
+        netUnits: 0,
+        byStatus: {}
+    };
 }
 
 export function emptyStats(): DashboardStats {
@@ -68,6 +87,14 @@ export function productUnitPrice(product: OzonPostingProduct | undefined): numbe
 export function postingTotal(posting: OzonPosting): number {
     return (posting.products || []).reduce(
         (total, product) => total + productUnitPrice(product) * (product.quantity || 1),
+        0
+    );
+}
+
+/** Units in a posting: the summed quantity, treating a missing quantity as one. */
+export function postingUnits(posting: OzonPosting): number {
+    return (posting.products || []).reduce(
+        (units, product) => units + (product.quantity || 1),
         0
     );
 }
@@ -119,6 +146,7 @@ export function calculateStats(postings: OzonPosting[], now = new Date()): Dashb
         if (Number.isNaN(createdAt.getTime())) continue;
 
         const total = postingTotal(posting);
+        const units = postingUnits(posting);
         const cancelled = posting.status === CANCELLED_STATUS;
         const crossCluster = isCrossCluster(posting);
 
@@ -127,10 +155,14 @@ export function calculateStats(postings: OzonPosting[], now = new Date()): Dashb
 
             const period = stats[key];
             period.sum += total;
+            period.units += units;
+            period.byStatus[posting.status] =
+                (period.byStatus[posting.status] ?? 0) + 1;
 
             if (cancelled) {
                 period.cancelled += 1;
                 period.cancelledSum += total;
+                period.cancelledUnits += units;
             } else {
                 period.count += 1;
             }
@@ -143,7 +175,29 @@ export function calculateStats(postings: OzonPosting[], now = new Date()): Dashb
 
     for (const key of PERIOD_KEYS) {
         stats[key].netSum = stats[key].sum - stats[key].cancelledSum;
+        stats[key].netUnits = stats[key].units - stats[key].cancelledUnits;
     }
 
     return stats;
+}
+
+/** Average net order value. Zero for an empty period. */
+export function averageOrderValue(period: PeriodStats): number {
+    return period.count > 0 ? period.netSum / period.count : 0;
+}
+
+/** Share of cancelled postings, in percent. Zero when there were none. */
+export function cancellationRate(period: PeriodStats): number {
+    const total = period.count + period.cancelled;
+    return total > 0 ? (period.cancelled / total) * 100 : 0;
+}
+
+/** Sold units per order (cancellations excluded). */
+export function unitsPerOrder(period: PeriodStats): number {
+    return period.count > 0 ? period.netUnits / period.count : 0;
+}
+
+/** Average price of a sold unit (cancellations excluded). */
+export function averageUnitPrice(period: PeriodStats): number {
+    return period.netUnits > 0 ? period.netSum / period.netUnits : 0;
 }

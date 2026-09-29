@@ -33,7 +33,7 @@ const MAX_WINDOWS = 8;
 const WINDOW_CONCURRENCY = 8;
 /** Parallel chunk requests for the id-based collectors. */
 const CHUNK_CONCURRENCY = 4;
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 const MAX_RETRY_DELAY_MS = 5000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -123,10 +123,11 @@ async function callOzonWithRetry<T>(
                 throw error;
             }
 
-            const waitMs = Math.min(
-                (error.retryAfterSeconds ?? 1) * 1000,
-                MAX_RETRY_DELAY_MS
-            );
+            // `Retry-After` wins when Ozon sends it; otherwise back off
+            // exponentially, which handles per-second limits without a fixed wait.
+            const waitMs = error.retryAfterSeconds
+                ? Math.min(error.retryAfterSeconds * 1000, MAX_RETRY_DELAY_MS)
+                : Math.min(500 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
             await delay(waitMs);
         }
     }
@@ -334,3 +335,4 @@ export async function collectPictures(
 
     return batches.flat();
 }
+

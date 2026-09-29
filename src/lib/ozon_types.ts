@@ -105,6 +105,7 @@ export interface OzonPicturesResponse {
 /** A posting reduced to what the orders table shows. */
 export interface DashboardPosting {
     posting_number: string;
+    order_number?: string;
     created_at: string;
     status: string;
     products: OzonPostingProduct[];
@@ -145,3 +146,4 @@ export interface StocksPayload {
     items: StockRow[];
     imagesMap: Record<string, string>;
 }
+

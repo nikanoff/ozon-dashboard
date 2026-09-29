@@ -18,6 +18,7 @@ export function toDashboardPosting(posting: OzonPosting): DashboardPosting {
 
     return {
         posting_number: posting.posting_number,
+        order_number: posting.order_number,
         created_at: posting.created_at,
         status: posting.status,
         products: (posting.products ?? []).map((product) => ({

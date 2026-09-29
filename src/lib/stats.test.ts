@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { calculateStats, isCrossCluster, postingTotal, productUnitPrice } from './stats';
+import {
+    averageOrderValue,
+    averageUnitPrice,
+    calculateStats,
+    cancellationRate,
+    isCrossCluster,
+    postingTotal,
+    postingUnits,
+    productUnitPrice,
+    unitsPerOrder
+} from './stats';
 import type { OzonPosting } from './ozon_types';
 
 /** Wednesday, 16 September 2026, local noon. */
@@ -61,6 +71,25 @@ describe('postingTotal', () => {
                 })
             )
         ).toBe(100);
+    });
+});
+
+describe('postingUnits', () => {
+    it('sums quantities and treats a missing one as a single unit', () => {
+        expect(
+            postingUnits(
+                posting({
+                    products: [
+                        { offer_id: 'a', sku: 1, quantity: 2 },
+                        { offer_id: 'b', sku: 2, quantity: 0 }
+                    ]
+                })
+            )
+        ).toBe(3);
+    });
+
+    it('is zero for a posting without products', () => {
+        expect(postingUnits(posting({ products: [] }))).toBe(0);
     });
 });
 
@@ -138,11 +167,75 @@ describe('calculateStats', () => {
         expect(stats.last31d.sum).toBe(0);
     });
 
+    it('counts units and groups postings by status', () => {
+        const stats = calculateStats(
+            [
+                posting({
+                    products: [{ offer_id: 'a', sku: 1, quantity: 3, price: { amount: '50', currency: 'RUB' } }]
+                }),
+                posting({ status: 'cancelled' }),
+                posting({ status: 'delivering' })
+            ],
+            NOW
+        );
+
+        expect(stats.calendarDay).toMatchObject({
+            count: 2,
+            units: 3 + 1 + 1,
+            netUnits: 3 + 1,
+            cancelledUnits: 1
+        });
+        expect(stats.calendarDay.byStatus).toEqual({
+            delivered: 1,
+            cancelled: 1,
+            delivering: 1
+        });
+    });
+
     it('returns zeroed periods for an empty list', () => {
         const stats = calculateStats([], NOW);
 
         for (const value of Object.values(stats)) {
-            expect(value).toEqual({ count: 0, sum: 0, cancelled: 0, cancelledSum: 0, netSum: 0, crossCluster: 0 });
+            expect(value).toEqual({
+                count: 0,
+                sum: 0,
+                cancelled: 0,
+                cancelledSum: 0,
+                netSum: 0,
+                crossCluster: 0,
+                units: 0,
+                cancelledUnits: 0,
+                netUnits: 0,
+                byStatus: {}
+            });
         }
+    });
+});
+
+describe('derived period metrics', () => {
+    it('derives AOV, cancellation rate, units per order and average price', () => {
+        const stats = calculateStats(
+            [
+                posting({ products: [{ offer_id: 'a', sku: 1, quantity: 2, price: { amount: '100', currency: 'RUB' } }] }),
+                posting({ status: 'cancelled' })
+            ],
+            NOW
+        );
+        const period = stats.calendarDay;
+
+        // 200 net revenue over one order, 2 units sold, one of two postings cancelled.
+        expect(averageOrderValue(period)).toBe(200);
+        expect(unitsPerOrder(period)).toBe(2);
+        expect(averageUnitPrice(period)).toBe(100);
+        expect(cancellationRate(period)).toBeCloseTo(50);
+    });
+
+    it('returns zeroes instead of dividing by zero', () => {
+        const period = calculateStats([], NOW).calendarMonth;
+
+        expect(averageOrderValue(period)).toBe(0);
+        expect(unitsPerOrder(period)).toBe(0);
+        expect(averageUnitPrice(period)).toBe(0);
+        expect(cancellationRate(period)).toBe(0);
     });
 });
