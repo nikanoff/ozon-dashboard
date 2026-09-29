@@ -1,15 +1,16 @@
 import { get } from 'svelte/store';
 import { ozonKeys } from './stores/ozon_keys';
+import type { DashboardPayload, StocksPayload } from './ozon_types';
 
 export interface OzonApiError extends Error {
     status: number;
-    /** Raw response body from the proxy, if available. */
+    /** Raw response body from the endpoint, if available. */
     payload: unknown;
 }
 
 function makeError(response: Response, payload: unknown): OzonApiError {
     const message =
-        (payload as any)?.message ||
+        (payload as { message?: string } | null)?.message ||
         `Ozon API error: ${response.status} ${response.statusText}`;
 
     const error = new Error(message) as OzonApiError;
@@ -18,17 +19,26 @@ function makeError(response: Response, payload: unknown): OzonApiError {
     return error;
 }
 
-export async function callOzon(path: string, body: any) {
+/**
+ * The pages no longer walk Ozon's cursors themselves: each endpoint returns the
+ * finished payload, so this is the only request the browser makes per page.
+ */
+async function callBundle<T>(
+    path: string,
+    signal?: AbortSignal,
+    body: unknown = {}
+): Promise<T> {
     const keys = get(ozonKeys);
 
-    const response = await fetch(`/api/ozon${path}`, {
+    const response = await fetch(path, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'X-Ozon-Client-Id': keys.clientId,
             'X-Ozon-Api-Key': keys.apiKey
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal
     });
 
     let payload: unknown = null;
@@ -42,76 +52,24 @@ export async function callOzon(path: string, body: any) {
         throw makeError(response, payload);
     }
 
-    return payload;
+    return payload as T;
 }
-
-export async function getStocks() {
-    return callOzon('/v4/product/info/stocks', {
-        filter: { visibility: 'ALL' },
-        limit: 1000
-    });
-}
-
-// v3 caps a single response at 100 postings, so the 31-day statistics need the
-// cursor followed across pages. Requests are issued one after another (each page
-// needs the previous cursor), keeping the request rate well below Ozon's limit.
-const FBO_STATUSES = [
-    'awaiting_packaging',
-    'awaiting_deliver',
-    'delivering',
-    'delivered',
-    'cancelled'
-];
 
 /**
- * Loads every page of FBO postings for the period.
+ * Orders, statistics and product images for the dashboard.
  *
- * Replaces the v2 method, which Ozon disabled on 1 June 2026. v3 differs in
- * several ways: sorting uses `sort_dir`, pagination uses a `cursor` instead of
- * `offset`, statuses are passed as an array, and items are nested under
- * `postings` in the response.
+ * Pass `since` to re-read only the recent tail of the history; the caller merges
+ * that into the payload it already holds.
  */
-export async function getAllFboPostings(since: string, to: string) {
-    const postings: any[] = [];
-    let cursor = '';
-
-    // Guard against a server that never reports `has_next: false`.
-    for (let page = 0; page < 50; page += 1) {
-        const response: any = await callOzon('/v3/posting/fbo/list', {
-            cursor,
-            filter: {
-                since,
-                to,
-                statuses: FBO_STATUSES
-            },
-            limit: 100,
-            sort_dir: 'DESC',
-            translit: true,
-            with: {
-                analytics_data: true,
-                financial_data: true
-            }
-        });
-
-        postings.push(...(response?.postings || []));
-
-        if (!response?.has_next || !response?.cursor) {
-            break;
-        }
-        cursor = response.cursor;
-    }
-
-    return { postings, result: postings };
+export function getDashboardData(signal?: AbortSignal, since?: string) {
+    return callBundle<DashboardPayload>(
+        '/api/dashboard',
+        signal,
+        since ? { since } : {}
+    );
 }
 
-export async function getProductImages(productIds: string[]) {
-    return callOzon('/v2/product/pictures/info', {
-        product_id: productIds
-    });
-}
-
-export async function getProductInfoList(skus: number[]) {
-    return callOzon('/v3/product/info/list', {
-        sku: skus
-    });
+/** Stock rows and their images for the inventory page. */
+export function getStocksData(signal?: AbortSignal) {
+    return callBundle<StocksPayload>('/api/stocks', signal);
 }

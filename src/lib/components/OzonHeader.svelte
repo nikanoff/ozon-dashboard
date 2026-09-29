@@ -1,0 +1,218 @@
+<script lang="ts">
+    import OzonAuth from "./OzonAuth.svelte";
+    import ChristmasDecoration from "./ChristmasDecoration.svelte";
+    import { ozonKeys } from "$lib/stores/ozon_keys";
+
+    interface Props {
+        title: string;
+        titleHref: string;
+        /** Rendered as "<subtitle>: <client id>". */
+        subtitle: string;
+        navHref: string;
+        navLabel: string;
+        validating: boolean;
+        onRefresh: () => void;
+    }
+
+    let {
+        title,
+        titleHref,
+        subtitle,
+        navHref,
+        navLabel,
+        validating,
+        onRefresh,
+    }: Props = $props();
+</script>
+
+<header class="header">
+    <div class="header-content">
+        <h1><a href={titleHref} class="title-link">{title}</a></h1>
+        <p class="subtitle">
+            {subtitle}: {$ozonKeys.clientId || "Not Configured"}
+        </p>
+        <nav class="nav-menu">
+            <a href={navHref} class="nav-link">{navLabel}</a>
+        </nav>
+    </div>
+    <div class="header-actions">
+        <button
+            class="btn-refresh glass"
+            onclick={onRefresh}
+            disabled={validating}
+        >
+            <svg
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                stroke="currentColor"
+                fill="none"
+                stroke-width="2"
+                ><path
+                    d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"
+                /></svg
+            >
+            {validating ? "Updating..." : "Refresh Data"}
+        </button>
+        <div class="status-badge" class:loading={validating}>
+            <span class="pulse"></span>
+            {validating ? "Validating..." : "Live"}
+        </div>
+        <OzonAuth />
+    </div>
+
+    <ChristmasDecoration />
+</header>
+
+<style>
+    .header {
+        position: relative;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: var(--space-xxl);
+        padding: var(--space-xl) 0;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+
+    h1 {
+        font-family: var(--font-heading);
+        font-size: 1.25rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin: 0;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+    }
+
+    .title-link {
+        color: inherit;
+        text-decoration: none;
+        transition: all 0.3s ease;
+        display: inline-block;
+        position: relative;
+    }
+
+    .title-link::after {
+        content: "";
+        position: absolute;
+        width: 0;
+        height: 1px;
+        bottom: -2px;
+        left: 0;
+        background-color: var(--accent-gold);
+        transition: width 0.3s ease;
+        opacity: 0.7;
+    }
+
+    .title-link:hover {
+        color: var(--accent-gold);
+        text-shadow: 0 0 15px rgba(212, 175, 55, 0.3);
+    }
+
+    .title-link:hover::after {
+        width: 100%;
+    }
+
+    .subtitle {
+        color: var(--text-muted);
+        font-size: 0.7rem;
+        margin-top: 8px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+    }
+
+    .nav-menu {
+        margin-top: 16px;
+    }
+
+    .nav-link {
+        color: var(--accent-gold);
+        text-decoration: none;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        transition: opacity 0.2s;
+    }
+
+    .nav-link:hover {
+        opacity: 0.7;
+    }
+
+    .status-badge {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 1rem;
+        border: 1px solid var(--border-subtle);
+        font-size: 0.7rem;
+        font-weight: 500;
+        color: var(--text-primary);
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+    }
+
+    .status-badge.loading {
+        border-color: #333;
+        color: #888;
+    }
+
+    .pulse {
+        width: 8px;
+        height: 8px;
+        background: currentColor;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+        0% {
+            opacity: 1;
+            transform: scale(1);
+        }
+        50% {
+            opacity: 0.4;
+            transform: scale(1.2);
+        }
+        100% {
+            opacity: 1;
+            transform: scale(1);
+        }
+    }
+
+    /* Transparent on purpose: this button also carries the global `.glass` class. */
+    .btn-refresh {
+        background: transparent;
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        padding: 0.5rem 1.25rem;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        font-size: 0.7rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        transition: all 0.3s ease;
+    }
+
+    .btn-refresh:hover:not(:disabled) {
+        background: rgba(255, 255, 255, 0.06);
+        border-color: var(--border-hover);
+        color: var(--text-primary);
+    }
+
+    .btn-refresh:disabled {
+        opacity: 0.2;
+        cursor: not-allowed;
+    }
+
+    .header-actions {
+        display: flex;
+        align-items: center;
+        gap: var(--space-md);
+    }
+</style>

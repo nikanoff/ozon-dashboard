@@ -2,7 +2,7 @@
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import { slide } from "svelte/transition";
 
-    let showSettings = false;
+    let showSettings = $state(false);
 
     function clickOutside(node: HTMLElement) {
         const handleClick = (event: MouseEvent) => {
@@ -24,7 +24,7 @@
 <div class="auth-settings" use:clickOutside>
     <button
         class="auth-toggle"
-        on:click={() => (showSettings = !showSettings)}
+        onclick={() => (showSettings = !showSettings)}
         title="API Configuration"
     >
         <svg

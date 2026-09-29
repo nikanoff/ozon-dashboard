@@ -1,82 +1,25 @@
 <script lang="ts">
-    import { getStocks, getProductImages } from "$lib/ozon_api";
+    import { getStocksData } from "$lib/ozon_api";
     import { useSWR } from "$lib/swr";
+    import { refreshOnKeysChange } from "$lib/refresh_on_keys";
     import { ozonKeys } from "$lib/stores/ozon_keys";
-    import OzonAuth from "$lib/components/OzonAuth.svelte";
+    import OzonHeader from "$lib/components/OzonHeader.svelte";
     import { onDestroy } from "svelte";
-    import { page } from "$app/stores";
-    import { tick } from "svelte";
-
-    let highlightSku: string | null = null;
-    let hasScrolled = false;
-
-    // Reactively update SKU from URL
-    $: highlightSku = $page.url.searchParams.get("highlight");
-
-    // Robust scroll logic: Runs when data exists AND we have a target SKU
-    $: if (highlightSku && $stocksData?.items?.length) {
-        handleScroll();
-    }
-
-    async function handleScroll() {
-        // Wait for DOM to render the new list
-        await tick();
-
-        // Give a tiny buffer for browser layout calculation
-        setTimeout(() => {
-            const element = document.querySelector(
-                `tr[data-sku="${highlightSku}"]`,
-            );
-
-            if (element) {
-                element.scrollIntoView({
-                    behavior: "smooth",
-                    block: "center",
-                });
-
-                element.classList.add("scroll-highlight");
-
-                // Remove class after animation
-                setTimeout(() => {
-                    element.classList.remove("scroll-highlight");
-                }, 2000);
-            }
-        }, 100);
-    }
+    import { page } from "$app/state";
+    import { get } from "svelte/store";
 
     const swrResult = useSWR(
-        "ozon-stocks",
-        async () => {
-            const stocks = await getStocks();
-            const items = stocks?.result?.items || stocks?.items || [];
-
-            // Fetch images based on unique product IDs
-            const productIds = Array.from(
-                new Set(items.map((i: any) => String(i.product_id))),
-            ) as string[];
-            const imagesMap: Record<string, string> = {};
-
-            if (productIds.length > 0) {
-                try {
-                    // Ozon API limit for pictures info is usually 100/1000 items, we handle it simply here
-                    const picsResponse = await getProductImages(productIds);
-                    const pics =
-                        picsResponse?.result?.items ||
-                        picsResponse?.items ||
-                        [];
-                    pics.forEach((p: any) => {
-                        imagesMap[String(p.product_id)] =
-                            p.primary_photo?.[0] || p.photo?.[0] || "";
-                    });
-                } catch (e) {
-                    console.error("Failed to fetch images:", e);
-                }
+        // Account-scoped key: cached data must not outlive a credentials change.
+        `ozon-stocks:${get(ozonKeys).clientId}`,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
             }
 
-            return {
-                items,
-                imagesMap,
-            };
+            // The endpoint collects stock rows and their images in one request.
+            return getStocksData(signal);
         },
         { dedupingInterval: 2000 },
     );
@@ -91,19 +34,33 @@
     } = swrResult;
 
     // Clean up resources when component is destroyed
-    onDestroy(() => {
-        console.log("[Stocks] Component destroyed, cleaning up SWR resources");
-        if (dispose) {
-            dispose();
-        }
+    onDestroy(dispose);
+
+    // Reload when the credentials change; useSWR already loads the initial value.
+    refreshOnKeysChange(() => mutate({ force: true }));
+
+    const error = $derived($swrError?.message ?? null);
+
+    // SKU to scroll to, taken from the URL (`/stocks?highlight=<sku>`).
+    const highlightSku = $derived(page.url.searchParams.get("highlight"));
+
+    // Runs once the table reflects the loaded data.
+    $effect(() => {
+        const sku = highlightSku;
+        if (!sku || !$stocksData?.items?.length) return;
+
+        const element = document.querySelector(`tr[data-sku="${sku}"]`);
+        if (!element) return;
+
+        element.scrollIntoView({ behavior: "smooth", block: "center" });
+        element.classList.add("scroll-highlight");
+        const timer = setTimeout(
+            () => element.classList.remove("scroll-highlight"),
+            2000,
+        );
+
+        return () => clearTimeout(timer);
     });
-
-    // Refresh data when keys change
-    $: if ($ozonKeys.clientId || $ozonKeys.apiKey) {
-        mutate();
-    }
-
-    $: error = $swrError?.message || null;
 </script>
 
 <svelte:head>
@@ -120,136 +77,15 @@
 </svelte:head>
 
 <div class="dashboard">
-    <header class="header">
-        <div class="header-content">
-            <h1><a href="/stocks" class="title-link">Product Stocks</a></h1>
-            <p class="subtitle">
-                Inventory management for Seller ID: {$ozonKeys.clientId ||
-                    "Not Configured"}
-            </p>
-            <nav class="nav-menu">
-                <a href="/" class="nav-link">← Dashboard</a>
-            </nav>
-        </div>
-        <div class="header-actions">
-            <button
-                class="btn-refresh glass"
-                on:click={() => mutate()}
-                disabled={$isValidating}
-            >
-                <svg
-                    viewBox="0 0 24 24"
-                    width="16"
-                    height="16"
-                    stroke="currentColor"
-                    fill="none"
-                    stroke-width="2"
-                    ><path
-                        d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"
-                    /></svg
-                >
-                {$isValidating ? "Updating..." : "Refresh Data"}
-            </button>
-            <div class="status-badge" class:loading={$isValidating}>
-                <span class="pulse"></span>
-                {$isValidating ? "Validating..." : "Live"}
-            </div>
-            <OzonAuth />
-        </div>
-
-        <!-- Christmas Decoration -->
-        <div class="christmas-decoration">
-            <div class="ornament-thread"></div>
-            <div class="ornament-shell">
-                <svg
-                    viewBox="0 0 50 60"
-                    width="50"
-                    height="60"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                >
-                    <!-- Sparkling Stars -->
-                    <circle
-                        class="sparkle s1"
-                        cx="10"
-                        cy="35"
-                        r="1"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s2"
-                        cx="40"
-                        cy="45"
-                        r="1.2"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s3"
-                        cx="15"
-                        cy="50"
-                        r="0.8"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s4"
-                        cx="35"
-                        cy="25"
-                        r="1"
-                        fill="white"
-                    />
-
-                    <!-- Attachment Ring/Star Base -->
-                    <circle
-                        cx="25"
-                        cy="5"
-                        r="3"
-                        stroke="#D4AF37"
-                        stroke-width="1"
-                        stroke-opacity="0.8"
-                    />
-
-                    <!-- Tree Shape (3 levels) -->
-                    <path
-                        d="M25 10L35 25H15L25 10Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.9"
-                    />
-                    <path
-                        d="M25 20L40 38H10L25 20Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.7"
-                    />
-                    <path
-                        d="M25 33L45 55H5L25 33Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.5"
-                    />
-
-                    <!-- Tree Trunk -->
-                    <rect
-                        x="22"
-                        y="55"
-                        width="6"
-                        height="4"
-                        stroke="#D4AF37"
-                        stroke-width="1"
-                        stroke-opacity="0.4"
-                    />
-
-                    <!-- Top Star Decoration -->
-                    <path
-                        d="M25 8L26.5 11.5L30 11.5L27 13.5L28.5 17L25 15L21.5 17L23 13.5L20 11.5L23.5 11.5L25 8Z"
-                        fill="#D4AF37"
-                        fill-opacity="0.8"
-                        class="sparkle s1"
-                    />
-                </svg>
-            </div>
-        </div>
-    </header>
+    <OzonHeader
+        title="Product Stocks"
+        titleHref="/stocks"
+        subtitle="Inventory management for Seller ID"
+        navHref="/"
+        navLabel="← Dashboard"
+        validating={$isValidating}
+        onRefresh={() => mutate({ force: true })}
+    />
 
     {#if error}
         <div class="error-card">
@@ -306,8 +142,9 @@
                         {:else if $stocksData && $stocksData.items}
                             {#each $stocksData.items as item (item.product_id)}
                                 <tr
-                                    class:highlighted={item.stocks?.[0]?.sku ==
-                                        highlightSku}
+                                    class:highlighted={String(
+                                        item.stocks?.[0]?.sku,
+                                    ) === highlightSku}
                                     data-sku={item.stocks?.[0]?.sku}
                                 >
                                     <td>
@@ -319,6 +156,10 @@
                                                     ]}
                                                     alt={item.offer_id}
                                                     class="product-thumb"
+                                                    width="48"
+                                                    height="48"
+                                                    loading="lazy"
+                                                    decoding="async"
                                                 />
                                             {:else}
                                                 <div
@@ -366,20 +207,19 @@
                                     </td>
                                     <td
                                         >{item.stocks.find(
-                                            (s: any) => s.type === "fbo",
+                                            (s) => s.type === "fbo",
                                         )?.present || 0}</td
                                     >
                                     <td
                                         >{item.stocks.reduce(
-                                            (acc: number, s: any) =>
+                                            (acc, s) =>
                                                 acc + (s.reserved || 0),
                                             0,
                                         )}</td
                                     >
                                     <td
                                         >{item.stocks.reduce(
-                                            (acc: number, s: any) =>
-                                                acc + s.present,
+                                            (acc, s) => acc + s.present,
                                             0,
                                         )}</td
                                     >
@@ -408,153 +248,6 @@
         max-width: var(--max-content-width);
         margin: 0 auto;
         padding: var(--space-lg) var(--space-md);
-    }
-
-    .header {
-        position: relative;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: var(--space-xxl);
-        padding: var(--space-xl) 0;
-        border-bottom: 1px solid var(--border-subtle);
-    }
-
-    h1 {
-        font-family: var(--font-heading);
-        font-size: 1.25rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        margin: 0;
-        letter-spacing: 0.15em;
-        text-transform: uppercase;
-    }
-
-    .title-link {
-        color: inherit;
-        text-decoration: none;
-        transition: all 0.3s ease;
-        display: inline-block;
-        position: relative;
-    }
-
-    .title-link::after {
-        content: "";
-        position: absolute;
-        width: 0;
-        height: 1px;
-        bottom: -2px;
-        left: 0;
-        background-color: var(--accent-gold);
-        transition: width 0.3s ease;
-        opacity: 0.7;
-    }
-
-    .title-link:hover {
-        color: var(--accent-gold);
-        text-shadow: 0 0 15px rgba(212, 175, 55, 0.3);
-    }
-
-    .title-link:hover::after {
-        width: 100%;
-    }
-
-    .subtitle {
-        color: var(--text-muted);
-        font-size: 0.7rem;
-        margin-top: 8px;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-    }
-
-    .nav-menu {
-        margin-top: 16px;
-    }
-
-    .nav-link {
-        color: var(--accent-gold);
-        text-decoration: none;
-        font-size: 0.75rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        transition: opacity 0.2s;
-    }
-
-    .nav-link:hover {
-        opacity: 0.7;
-    }
-
-    .status-badge {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem 1rem;
-        border: 1px solid var(--border-subtle);
-        font-size: 0.7rem;
-        font-weight: 500;
-        color: var(--text-primary);
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-    }
-
-    .status-badge.loading {
-        border-color: #333;
-        color: #888;
-    }
-
-    .pulse {
-        width: 8px;
-        height: 8px;
-        background: currentColor;
-        border-radius: 50%;
-        animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-        0%,
-        100% {
-            opacity: 1;
-            transform: scale(1);
-        }
-        50% {
-            opacity: 0.4;
-            transform: scale(1.2);
-        }
-    }
-
-    .btn-refresh {
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary);
-        padding: 0.5rem 1.25rem;
-        border-radius: var(--radius-sm);
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        font-size: 0.7rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        transition: all 0.3s ease;
-    }
-
-    .btn-refresh:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.06);
-        border-color: var(--border-hover);
-        color: var(--text-primary);
-    }
-
-    .btn-refresh:disabled {
-        opacity: 0.2;
-        cursor: not-allowed;
-    }
-
-    .header-actions {
-        display: flex;
-        align-items: center;
-        gap: var(--space-md);
     }
 
     .card {
@@ -804,83 +497,6 @@
         align-items: center;
         gap: 1rem;
         margin-bottom: 2rem;
-    }
-
-    /* Christmas Decoration Styling */
-    .christmas-decoration {
-        position: absolute;
-        top: 100%;
-        margin-top: -1px;
-        left: 75%;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        transform-origin: top center;
-        animation: sway 5s ease-in-out infinite;
-        pointer-events: all;
-        cursor: pointer;
-        z-index: 100;
-    }
-
-    .ornament-thread {
-        width: 1px;
-        height: 80px;
-        background: linear-gradient(to bottom, #d4af37, transparent);
-        opacity: 0.5;
-    }
-
-    .ornament-shell {
-        transition: all 0.3s ease;
-    }
-
-    .sparkle {
-        animation: sparkle-anim 2s infinite ease-in-out;
-        opacity: 0;
-    }
-    .s1 {
-        animation-delay: 0.2s;
-    }
-    .s2 {
-        animation-delay: 0.7s;
-    }
-    .s3 {
-        animation-delay: 1.2s;
-    }
-    .s4 {
-        animation-delay: 1.8s;
-    }
-
-    @keyframes sway {
-        0% {
-            transform: rotate(-6deg);
-        }
-        50% {
-            transform: rotate(6deg);
-        }
-        100% {
-            transform: rotate(-6deg);
-        }
-    }
-
-    @keyframes sparkle-anim {
-        0%,
-        100% {
-            opacity: 0;
-            transform: scale(0);
-        }
-        50% {
-            opacity: 0.8;
-            transform: scale(1.2);
-        }
-    }
-
-    .christmas-decoration:hover .ornament-shell {
-        filter: drop-shadow(0 0 12px rgba(255, 255, 255, 0.4));
-    }
-
-    .christmas-decoration:hover .sparkle {
-        animation-duration: 0.8s;
-        opacity: 1;
     }
 
     @keyframes shimmer {

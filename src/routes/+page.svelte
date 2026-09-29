@@ -1,71 +1,48 @@
 <script lang="ts">
-    import { getAllFboPostings, getProductInfoList } from "$lib/ozon_api";
-    import { useSWR } from "$lib/swr";
+    import { getDashboardData } from "$lib/ozon_api";
+    import {
+        mergeDashboardPayload,
+        needsFullLoad,
+        refreshSince,
+    } from "$lib/dashboard_cache";
+    import type { DashboardPayload } from "$lib/ozon_types";
+    import { peekCache, useSWR } from "$lib/swr";
+    import { refreshOnKeysChange } from "$lib/refresh_on_keys";
+    import { calculateStats, productUnitPrice } from "$lib/stats";
     import { ozonKeys } from "$lib/stores/ozon_keys";
-    import OzonAuth from "$lib/components/OzonAuth.svelte";
-    import { onMount, onDestroy } from "svelte";
+    import OzonHeader from "$lib/components/OzonHeader.svelte";
+    import { get } from "svelte/store";
+    import { onDestroy } from "svelte";
+
+    const cacheKey = `ozon-dashboard:${get(ozonKeys).clientId}`;
 
     const swrResult = useSWR(
-        "ozon-dashboard",
-        async () => {
-            const thirtyOneDaysAgo = new Date(
-                Date.now() - 31 * 24 * 60 * 60 * 1000,
-            ).toISOString();
-
-            const postingsResponse = await getAllFboPostings(
-                thirtyOneDaysAgo,
-                new Date().toISOString(),
-            ).catch(() => null);
-
-            // v3 nests the items under `postings`; the v2 `result` key is kept as
-            // a fallback so the page tolerates either shape.
-            const postings =
-                postingsResponse?.postings || postingsResponse?.result || [];
-
-            // Collect all unique SKUs from all products in all postings
-            const allSkus = Array.from(
-                new Set(
-                    postings.flatMap(
-                        (p: any) =>
-                            p.products?.map((prod: any) => prod.sku) || [],
-                    ),
-                ),
-            ) as number[];
-
-            const skuToImage: Record<number, string> = {};
-
-            if (allSkus.length > 0) {
-                try {
-                    // Fetch product info in batches of 1000 (Ozon limit for info/list)
-                    // For now, we assume < 1000 unique SKUs in 31 days
-                    const skusToFetch = allSkus.slice(0, 1000);
-                    const infoResponse = await getProductInfoList(skusToFetch);
-                    const items =
-                        infoResponse?.result?.items ||
-                        infoResponse?.items ||
-                        infoResponse?.result ||
-                        [];
-
-                    items.forEach((item: any) => {
-                        if (item.sku) {
-                            skuToImage[item.sku] =
-                                item.primary_image || item.images?.[0] || "";
-                        }
-                    });
-                } catch (e) {
-                    console.error(
-                        "Failed to fetch product info for dashboard images:",
-                        e,
-                    );
-                }
+        // Account-scoped key: cached data must not outlive a credentials change.
+        cacheKey,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
             }
 
-            return {
-                postings,
-                skuToImage,
-            };
+            const previous = peekCache<DashboardPayload>(cacheKey);
+
+            // Only the recent tail of the history can still change, so a refresh
+            // asks for that window and folds it into what is already on screen.
+            if (previous && !needsFullLoad(previous)) {
+                return mergeDashboardPayload(
+                    previous,
+                    await getDashboardData(signal, refreshSince()),
+                );
+            }
+
+            // The endpoint walks Ozon's cursors server-side and returns only the
+            // fields the table renders, so the browser makes a single request.
+            return getDashboardData(signal);
         },
-        { dedupingInterval: 2000, refreshInterval: 60000 },
+        // The 31-day figures change slowly, so a minute was far too eager.
+        { dedupingInterval: 2000, refreshInterval: 5 * 60 * 1000 },
     );
 
     const {
@@ -77,227 +54,54 @@
         dispose,
     } = swrResult;
 
-    // Dynamic title for browser tab with calendarDay value
-    let pageTitle = "Ozon Seller Dashboard | Аналитика продаж";
-
-    function updatePageTitle() {
-        const netSum = stats.calendarDay.netSum;
-        if (netSum > 0) {
-            const formatted = formatCurrency(netSum).replace("₽", "").trim();
-            pageTitle = `${formatted} ₽ сегодня | Ozon Dashboard`;
-        } else {
-            pageTitle = "Ozon Seller Dashboard | Аналитика продаж";
-        }
-    }
+    // Reload when the credentials change; useSWR already loads the initial value.
+    refreshOnKeysChange(() => mutate({ force: true }));
 
     // Clean up resources when component is destroyed
-    onDestroy(() => {
-        console.log(
-            "[Dashboard] Component destroyed, cleaning up SWR resources",
-        );
-        if (dispose) {
-            dispose();
-        }
+    onDestroy(dispose);
+
+    const currencyFormatter = new Intl.NumberFormat("ru-RU", {
+        style: "currency",
+        currency: "RUB",
+        maximumFractionDigits: 0,
     });
 
-    // Update title when stats change (reactive)
-    $: if (stats.calendarDay.netSum >= 0) {
-        updatePageTitle();
+    function formatCurrency(value: number) {
+        return currencyFormatter.format(value);
     }
 
-    // Refresh data when keys change
-    $: if ($ozonKeys.clientId || $ozonKeys.apiKey) {
-        mutate();
-    }
+    const postingsData = $derived($dashboardData?.postings ?? []);
+    const error = $derived($swrError?.message ?? null);
 
-    $: postingsData = $dashboardData?.postings || [];
-    $: error = $swrError?.message || null;
+    // Recomputed whenever the postings change.
+    const stats = $derived(calculateStats(postingsData));
+
+    // Dynamic title for the browser tab, showing today's net sales once there are any.
+    const pageTitle = $derived(
+        stats.calendarDay.netSum > 0
+            ? `${formatCurrency(stats.calendarDay.netSum).replace("₽", "").trim()} ₽ сегодня | Ozon Dashboard`
+            : "Ozon Seller Dashboard | Аналитика продаж",
+    );
 
     // Pagination for orders
-    let currentPage = 1;
+    let currentPage = $state(1);
     const itemsPerPage = 10;
-    $: totalPages = Math.ceil(postingsData.length / itemsPerPage);
-    $: sortedPostings = [...postingsData].sort(
-        (a, b) =>
-            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+    const totalPages = $derived(Math.ceil(postingsData.length / itemsPerPage));
+    const sortedPostings = $derived(
+        [...postingsData].sort(
+            (a, b) =>
+                new Date(b.created_at).getTime() -
+                new Date(a.created_at).getTime(),
+        ),
     );
-    $: paginatedPostings = sortedPostings.slice(
-        (currentPage - 1) * itemsPerPage,
-        currentPage * itemsPerPage,
+    const paginatedPostings = $derived(
+        sortedPostings.slice(
+            (currentPage - 1) * itemsPerPage,
+            currentPage * itemsPerPage,
+        ),
     );
 
-    // Stats variables
-    let stats = {
-        last24h: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-        last7d: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-        last31d: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-        calendarDay: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-        calendarWeek: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-        calendarMonth: {
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        },
-    };
-
-    $: if (postingsData) {
-        calculateStats();
-    }
-
-    function formatCurrency(value: number) {
-        return new Intl.NumberFormat("ru-RU", {
-            style: "currency",
-            currency: "RUB",
-            maximumFractionDigits: 0,
-        }).format(value);
-    }
-
-    /**
-     * Reads a product's unit price.
-     *
-     * The v3 API returns `price` as `{ amount, currency }`, while v2 used a plain
-     * string. Both shapes are accepted so totals never become NaN.
-     */
-    function productUnitPrice(product: any): number {
-        const raw =
-            typeof product?.price === "object" && product.price !== null
-                ? product.price.amount
-                : product?.price;
-        const value = parseFloat(raw);
-        return Number.isFinite(value) ? value : 0;
-    }
-
-    function calculateStats() {
-        const createEmptyStat = () => ({
-            count: 0,
-            sum: 0,
-            cancelled: 0,
-            cancelledSum: 0,
-            netSum: 0,
-            crossCluster: 0,
-        });
-
-        // Use local variable for calculation to avoid premature reactivity updates
-        const newStats = {
-            last24h: createEmptyStat(),
-            last7d: createEmptyStat(),
-            last31d: createEmptyStat(),
-            calendarDay: createEmptyStat(),
-            calendarWeek: createEmptyStat(),
-            calendarMonth: createEmptyStat(),
-        };
-
-        const now = new Date();
-        const startOfDay = new Date(
-            now.getFullYear(),
-            now.getMonth(),
-            now.getDate(),
-        );
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-        const day = now.getDay();
-        const startOfWeek = new Date(now);
-        startOfWeek.setDate(now.getDate() - day + (day === 0 ? -6 : 1));
-        startOfWeek.setHours(0, 0, 0, 0);
-
-        const limit24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        const limit7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        const limit31d = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
-
-        const periods = [
-            { key: "last24h", limit: limit24h },
-            { key: "last7d", limit: limit7d },
-            { key: "last31d", limit: limit31d },
-            { key: "calendarDay", limit: startOfDay },
-            { key: "calendarWeek", limit: startOfWeek },
-            { key: "calendarMonth", limit: startOfMonth },
-        ];
-
-        postingsData.forEach((p: any) => {
-            // Use created_at for consistent sales statistics based on order time
-            const pDate = new Date(p.created_at);
-            // v3 returns `price` as an object ({ amount, currency }), while v2 used
-            // a plain string. Handle both so totals never collapse into NaN.
-            const price = (p.products || []).reduce(
-                (acc: number, prod: any) =>
-                    acc + productUnitPrice(prod) * (prod.quantity || 1),
-                0,
-            );
-
-            periods.forEach(({ key, limit }) => {
-                // Unified logic: Check if order date is after the limit threshold
-                const isMatch = pDate >= limit;
-
-                if (isMatch) {
-                    // Type assertion to access dynamic keys on defined structure
-                    const k = key as keyof typeof newStats;
-                    newStats[k].sum += price;
-
-                    if (p.status === "cancelled") {
-                        newStats[k].cancelled++;
-                        newStats[k].cancelledSum += price;
-                    } else {
-                        newStats[k].count++;
-                    }
-
-                    if (
-                        p.financial_data?.cluster_from &&
-                        p.financial_data?.cluster_to &&
-                        p.financial_data.cluster_from !==
-                            p.financial_data.cluster_to
-                    ) {
-                        newStats[k].crossCluster++;
-                    }
-
-                    newStats[k].netSum =
-                        newStats[k].sum - newStats[k].cancelledSum;
-                }
-            });
-        });
-
-        // Final assignment triggers reactivity once
-        stats = newStats;
-    }
-
-    $: statsConfig = [
+    const statsConfig = $derived([
         {
             label: "Last 24 Hours",
             value: stats.last24h,
@@ -334,7 +138,7 @@
             color: "#3B82F6",
             icon: `<path d="M21.21 15.89A10 10 0 118 2.83M22 12A10 10 0 0012 2v10h10z" />`,
         },
-    ];
+    ]);
 </script>
 
 <svelte:head>
@@ -351,136 +155,15 @@
 </svelte:head>
 
 <div class="dashboard">
-    <header class="header">
-        <div class="header-content">
-            <h1><a href="/" class="title-link">Ozon Dashboard</a></h1>
-            <p class="subtitle">
-                Real-time business insights for Seller ID: {$ozonKeys.clientId ||
-                    "Not Configured"}
-            </p>
-            <nav class="nav-menu">
-                <a href="/stocks" class="nav-link">View Stocks →</a>
-            </nav>
-        </div>
-        <div class="header-actions">
-            <button
-                class="btn-refresh glass"
-                on:click={() => mutate()}
-                disabled={$isValidating}
-            >
-                <svg
-                    viewBox="0 0 24 24"
-                    width="16"
-                    height="16"
-                    stroke="currentColor"
-                    fill="none"
-                    stroke-width="2"
-                    ><path
-                        d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"
-                    /></svg
-                >
-                {$isValidating ? "Updating..." : "Refresh Data"}
-            </button>
-            <div class="status-badge" class:loading={$isValidating}>
-                <span class="pulse"></span>
-                {$isValidating ? "Validating..." : "Live"}
-            </div>
-            <OzonAuth />
-        </div>
-
-        <!-- Christmas Decoration -->
-        <div class="christmas-decoration">
-            <div class="ornament-thread"></div>
-            <div class="ornament-shell">
-                <svg
-                    viewBox="0 0 50 60"
-                    width="50"
-                    height="60"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                >
-                    <!-- Sparkling Stars -->
-                    <circle
-                        class="sparkle s1"
-                        cx="10"
-                        cy="35"
-                        r="1"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s2"
-                        cx="40"
-                        cy="45"
-                        r="1.2"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s3"
-                        cx="15"
-                        cy="50"
-                        r="0.8"
-                        fill="white"
-                    />
-                    <circle
-                        class="sparkle s4"
-                        cx="35"
-                        cy="25"
-                        r="1"
-                        fill="white"
-                    />
-
-                    <!-- Attachment Ring/Star Base -->
-                    <circle
-                        cx="25"
-                        cy="5"
-                        r="3"
-                        stroke="#D4AF37"
-                        stroke-width="1"
-                        stroke-opacity="0.8"
-                    />
-
-                    <!-- Tree Shape (3 levels) -->
-                    <path
-                        d="M25 10L35 25H15L25 10Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.9"
-                    />
-                    <path
-                        d="M25 20L40 38H10L25 20Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.7"
-                    />
-                    <path
-                        d="M25 33L45 55H5L25 33Z"
-                        stroke="#D4AF37"
-                        stroke-width="1.2"
-                        stroke-opacity="0.5"
-                    />
-
-                    <!-- Tree Trunk -->
-                    <rect
-                        x="22"
-                        y="55"
-                        width="6"
-                        height="4"
-                        stroke="#D4AF37"
-                        stroke-width="1"
-                        stroke-opacity="0.4"
-                    />
-
-                    <!-- Top Star Decoration -->
-                    <path
-                        d="M25 8L26.5 11.5L30 11.5L27 13.5L28.5 17L25 15L21.5 17L23 13.5L20 11.5L23.5 11.5L25 8Z"
-                        fill="#D4AF37"
-                        fill-opacity="0.8"
-                        class="sparkle s1"
-                    />
-                </svg>
-            </div>
-        </div>
-    </header>
+    <OzonHeader
+        title="Ozon Dashboard"
+        titleHref="/"
+        subtitle="Real-time business insights for Seller ID"
+        navHref="/stocks"
+        navLabel="View Stocks →"
+        validating={$isValidating}
+        onRefresh={() => mutate({ force: true })}
+    />
 
     {#if error}
         <div class="error-card">
@@ -725,7 +408,7 @@
                     <button
                         class="btn-page"
                         disabled={currentPage === 1}
-                        on:click={() => currentPage--}>Prev</button
+                        onclick={() => currentPage--}>Prev</button
                     >
                     <span class="page-info"
                         >Page {currentPage} of {totalPages || 1}</span
@@ -733,7 +416,7 @@
                     <button
                         class="btn-page"
                         disabled={currentPage >= totalPages}
-                        on:click={() => currentPage++}>Next</button
+                        onclick={() => currentPage++}>Next</button
                     >
                 </div>
             </div>
@@ -792,6 +475,10 @@
                                                         ]}
                                                         alt={product.name}
                                                         class="product-thumb"
+                                                        width="48"
+                                                        height="48"
+                                                        loading="lazy"
+                                                        decoding="async"
                                                     />
                                                 {:else}
                                                     <div
@@ -841,14 +528,6 @@
                                             )}</td
                                         >
                                         {#if i === 0}
-                                            {@const allActions = [
-                                                ...new Set(
-                                                    posting.financial_data?.products?.flatMap(
-                                                        (p: any) =>
-                                                            p.actions || [],
-                                                    ) || [],
-                                                ),
-                                            ]}
                                             <td
                                                 rowspan={posting.products
                                                     .length}
@@ -906,8 +585,8 @@
                                                     .length}
                                             >
                                                 <div class="actions-list">
-                                                    {#if allActions.length > 0}
-                                                        {#each allActions as action}
+                                                    {#if posting.actions.length > 0}
+                                                        {#each posting.actions as action}
                                                             <span
                                                                 class="action-tag"
                                                                 >{action}</span
@@ -949,81 +628,6 @@
         padding: var(--space-lg) var(--space-md);
     }
 
-    .header {
-        position: relative;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: var(--space-xxl);
-        padding: var(--space-xl) 0;
-        border-bottom: 1px solid var(--border-subtle);
-    }
-
-    h1 {
-        font-family: var(--font-heading);
-        font-size: 1.25rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        margin: 0;
-        letter-spacing: 0.15em;
-        text-transform: uppercase;
-    }
-
-    .title-link {
-        color: inherit;
-        text-decoration: none;
-        transition: all 0.3s ease;
-        display: inline-block;
-        position: relative;
-    }
-
-    .title-link::after {
-        content: "";
-        position: absolute;
-        width: 0;
-        height: 1px;
-        bottom: -2px;
-        left: 0;
-        background-color: var(--accent-gold);
-        transition: width 0.3s ease;
-        opacity: 0.7;
-    }
-
-    .title-link:hover {
-        color: var(--accent-gold);
-        text-shadow: 0 0 15px rgba(212, 175, 55, 0.3);
-    }
-
-    .title-link:hover::after {
-        width: 100%;
-    }
-
-    .subtitle {
-        color: var(--text-muted);
-        font-size: 0.7rem;
-        margin-top: 8px;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-    }
-
-    .nav-menu {
-        margin-top: 16px;
-    }
-
-    .nav-link {
-        color: var(--accent-gold);
-        text-decoration: none;
-        font-size: 0.75rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        transition: opacity 0.2s;
-    }
-
-    .nav-link:hover {
-        opacity: 0.7;
-    }
-
     .actions-list {
         display: flex;
         flex-direction: column;
@@ -1043,47 +647,6 @@
     .no-actions {
         color: var(--text-muted);
         font-size: 0.8125rem;
-    }
-
-    .status-badge {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem 1rem;
-        border: 1px solid var(--border-subtle);
-        font-size: 0.7rem;
-        font-weight: 500;
-        color: var(--text-primary);
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-    }
-
-    .status-badge.loading {
-        border-color: #333;
-        color: #888;
-    }
-
-    .pulse {
-        width: 8px;
-        height: 8px;
-        background: currentColor;
-        border-radius: 50%;
-        animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-        0% {
-            opacity: 1;
-            transform: scale(1);
-        }
-        50% {
-            opacity: 0.4;
-            transform: scale(1.2);
-        }
-        100% {
-            opacity: 1;
-            transform: scale(1);
-        }
     }
 
     .card {
@@ -1232,40 +795,6 @@
         font-weight: 600;
         letter-spacing: 0.05em;
         opacity: 0.9;
-    }
-
-    .btn-refresh {
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary);
-        padding: 0.5rem 1.25rem;
-        border-radius: var(--radius-sm);
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        font-size: 0.7rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        transition: all 0.3s ease;
-    }
-
-    .btn-refresh:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.06);
-        border-color: var(--border-hover);
-        color: var(--text-primary);
-    }
-
-    .btn-refresh:disabled {
-        opacity: 0.2;
-        cursor: not-allowed;
-    }
-
-    .header-actions {
-        display: flex;
-        align-items: center;
-        gap: var(--space-md);
     }
 
     .table-container {
@@ -1642,14 +1171,6 @@
         background: rgba(255, 255, 255, 0.1);
     }
 
-    .gold-text {
-        color: var(--accent-gold);
-    }
-
-    .white-text {
-        color: var(--text-primary);
-    }
-
     .text-error {
         color: var(--error);
     }
@@ -1661,15 +1182,6 @@
 
     .card-value-group {
         margin: auto 0;
-    }
-
-    .mini-stat-row {
-        display: flex;
-        justify-content: space-between;
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        border-top: 1px solid rgba(255, 255, 255, 0.05);
-        padding-top: 12px;
     }
 
     .small-card {
@@ -1685,89 +1197,6 @@
     .micro-stat {
         font-size: 0.7rem;
         color: var(--text-muted);
-    }
-
-    /* Christmas Decoration Styling */
-    .christmas-decoration {
-        position: absolute;
-        top: 100%; /* Exactly at the bottom border of header */
-        margin-top: -1px; /* Align perfectly with the 1px border */
-        left: 75%; /* Positioned at 3/4 of the line */
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        transform-origin: top center;
-        animation: sway 5s ease-in-out infinite;
-        pointer-events: all;
-        cursor: pointer;
-        z-index: 100;
-    }
-
-    .ornament-thread {
-        width: 1px;
-        height: 80px;
-        background: linear-gradient(to bottom, #d4af37, transparent);
-        opacity: 0.5;
-    }
-
-    .ornament-shell {
-        transition: all 0.3s ease;
-        filter: drop-shadow(0 0 0px transparent);
-    }
-
-    .sparkle {
-        animation: sparkle-anim 2s infinite ease-in-out;
-        opacity: 0;
-    }
-
-    .s1 {
-        animation-delay: 0.2s;
-    }
-    .s2 {
-        animation-delay: 0.7s;
-    }
-    .s3 {
-        animation-delay: 1.2s;
-    }
-    .s4 {
-        animation-delay: 1.8s;
-    }
-
-    @keyframes sparkle-anim {
-        0%,
-        100% {
-            opacity: 0;
-            transform: scale(0);
-        }
-        50% {
-            opacity: 0.8;
-            transform: scale(1.2);
-        }
-    }
-
-    .christmas-decoration:hover .ornament-shell {
-        filter: drop-shadow(0 0 12px rgba(255, 255, 255, 0.4));
-    }
-
-    .christmas-decoration:hover .sparkle {
-        animation-duration: 0.8s;
-        opacity: 1;
-    }
-
-    .christmas-decoration:hover {
-        animation-duration: 1.5s;
-    }
-
-    @keyframes sway {
-        0% {
-            transform: rotate(-6deg);
-        }
-        50% {
-            transform: rotate(6deg);
-        }
-        100% {
-            transform: rotate(-6deg);
-        }
     }
 
     @keyframes shimmer {

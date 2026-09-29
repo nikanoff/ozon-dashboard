@@ -7,22 +7,40 @@ export interface SWROptions<T> {
     initialData?: T;
 }
 
+export interface SWRMutateOptions {
+    /** Skip the deduping window so a manual refresh always refetches. */
+    force?: boolean;
+}
+
 export interface SWRResponse<T> {
     data: Writable<T | undefined>;
     error: Writable<any>;
     isValidating: Writable<boolean>;
     isLoading: Writable<boolean>;
-    mutate: () => Promise<void>;
-    dispose?: () => void;  // Function to clean up resources
+    mutate: (options?: SWRMutateOptions) => Promise<void>;
+    dispose: () => void;
 }
 
 const cache = new Map<string, any>();
 const lastFetch = new Map<string, number>();
-const focusListeners = new Map<string, () => void>();  // Track focus listeners for cleanup
+const inFlight = new Map<string, { promise: Promise<void>; controller: AbortController }>();
+
+/**
+ * Reads the cached payload for a key without subscribing.
+ *
+ * Used to fold a partial refresh into the data that is already on screen.
+ */
+export function peekCache<T>(key: string): T | undefined {
+    return cache.get(key);
+}
+
+function isAbortError(error: unknown) {
+    return (error as { name?: string } | null)?.name === 'AbortError';
+}
 
 export function useSWR<T>(
     key: string,
-    fetcher: () => Promise<T>,
+    fetcher: (signal: AbortSignal) => Promise<T>,
     options: SWROptions<T> = {}
 ): SWRResponse<T> {
     const {
@@ -37,77 +55,87 @@ export function useSWR<T>(
     const isValidating = writable(false);
     const isLoading = writable(!cache.has(key));
 
-    async function mutate() {
+    /**
+     * Loads the data for this key.
+     *
+     * `force` skips the deduping window, so a manual refresh always refetches.
+     * Concurrent callers for the same key always share one request: without that,
+     * the initial load and a credentials-change refresh would run the whole
+     * request chain twice in parallel.
+     */
+    async function mutate({ force = false }: SWRMutateOptions = {}) {
         const now = Date.now();
         const last = lastFetch.get(key) || 0;
 
-        if (now - last < dedupingInterval && cache.has(key)) {
+        if (!force && cache.has(key) && now - last < dedupingInterval) {
             return;
         }
 
-        isValidating.set(true);
-        try {
-            const result = await fetcher();
-            cache.set(key, result);
-            lastFetch.set(key, now);
-            data.set(result);
-            error.set(null);
-        } catch (e) {
-            error.set(e);
-        } finally {
-            isValidating.set(false);
-            isLoading.set(false);
+        const pending = inFlight.get(key);
+        if (pending) {
+            // Join the request that is already running. A forced call still needs
+            // its own fresh result once that one settles.
+            await pending.promise.catch(() => {});
+            if (!force) return;
         }
+
+        const controller = new AbortController();
+        isValidating.set(true);
+
+        const promise = (async () => {
+            try {
+                const result = await fetcher(controller.signal);
+                cache.set(key, result);
+                lastFetch.set(key, Date.now());
+                data.set(result);
+                error.set(null);
+            } catch (e) {
+                // An abort is a teardown, not a failure worth showing the user.
+                if (!isAbortError(e)) {
+                    error.set(e);
+                }
+            } finally {
+                inFlight.delete(key);
+                isValidating.set(false);
+                isLoading.set(false);
+            }
+        })();
+
+        inFlight.set(key, { promise, controller });
+        await promise;
     }
 
     // Initial fetch
     mutate();
 
-    // Revalidate on focus - with proper cleanup to prevent memory leaks
-    let dispose: (() => void) | undefined = undefined;
-    let refreshIntervalId: ReturnType<typeof setInterval> | undefined = undefined;
+    let refreshIntervalId: ReturnType<typeof setInterval> | undefined;
 
-    // Setup refresh interval if specified
     if (refreshInterval > 0 && typeof window !== 'undefined') {
         refreshIntervalId = setInterval(() => {
-            console.log(`[SWR] Auto-refreshing data for key: ${key}`);
+            // Skip background tabs: nobody is looking, and Ozon's rate limits are
+            // per account.
+            if (document.hidden) return;
             mutate();
         }, refreshInterval);
-        console.log(`[SWR] Started refresh interval (${refreshInterval}ms) for key: ${key}`);
     }
+
+    let handleFocus: (() => void) | undefined;
 
     if (revalidateOnFocus && typeof window !== 'undefined') {
-        const handleFocus = () => {
-            console.log(`[SWR] Revalidating on focus for key: ${key}`);
-            mutate();
-        };
+        handleFocus = () => mutate();
         window.addEventListener('focus', handleFocus);
-        console.log(`[SWR] Added focus listener for key: ${key}`);
-
-        // Store the listener function for cleanup
-        focusListeners.set(key, handleFocus);
-
-        dispose = () => {
-            const listener = focusListeners.get(key);
-            if (listener) {
-                window.removeEventListener('focus', listener);
-                focusListeners.delete(key);
-                console.log(`[SWR] Removed focus listener for key: ${key}`);
-            }
-            if (refreshIntervalId) {
-                clearInterval(refreshIntervalId);
-                console.log(`[SWR] Cleared refresh interval for key: ${key}`);
-            }
-        };
-    } else if (refreshIntervalId) {
-        // If no focus listener but we have an interval, still need dispose
-        dispose = () => {
-            if (refreshIntervalId) {
-                clearInterval(refreshIntervalId);
-                console.log(`[SWR] Cleared refresh interval for key: ${key}`);
-            }
-        };
     }
+
+    const dispose = () => {
+        if (handleFocus) {
+            window.removeEventListener('focus', handleFocus);
+        }
+        if (refreshIntervalId) {
+            clearInterval(refreshIntervalId);
+        }
+        // Drop the request this component is waiting for.
+        inFlight.get(key)?.controller.abort();
+    };
 
     return {
         data,
@@ -117,5 +145,4 @@ export function useSWR<T>(
         mutate,
         dispose
     };
-
 }
