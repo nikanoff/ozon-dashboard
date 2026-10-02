@@ -169,4 +169,12 @@
             transform: rotate(-6deg);
         }
     }
+
+    /* The ornament hangs 80px below the header and would overlap content on
+       small screens, where space is tight. */
+    @media (max-width: 768px) {
+        .christmas-decoration {
+            display: none;
+        }
+    }
 </style>

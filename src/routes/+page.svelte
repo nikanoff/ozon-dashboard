@@ -1323,6 +1323,8 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: var(--space-md);
+        flex-wrap: wrap;
         margin-bottom: var(--space-lg);
     }
 
@@ -1681,6 +1683,7 @@
         gap: var(--space-md);
         padding-top: var(--space-md);
         border-top: 1px solid rgba(255, 255, 255, 0.05);
+        flex-wrap: wrap;
     }
 
     .sub-stat {
@@ -1788,7 +1791,7 @@
 
     .kpi-strip {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr));
         gap: 12px;
         margin-bottom: var(--space-lg);
     }
@@ -1844,6 +1847,7 @@
         align-items: baseline;
         gap: var(--space-md);
         margin-bottom: var(--space-md);
+        flex-wrap: wrap;
     }
 
     .panel-controls {
@@ -1883,7 +1887,7 @@
 
     .breakdown-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
         gap: 16px;
     }
 
@@ -1937,7 +1941,7 @@
 
     .top-list {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
         gap: 10px 24px;
     }
 
@@ -2189,5 +2193,78 @@
     .hour-axis span {
         flex: 1;
         text-align: center;
+    }
+
+    /* --- Mobile / small-screen layout --- */
+    @media (max-width: 640px) {
+        .dashboard {
+            max-width: 100%;
+            padding: var(--space-md) var(--space-sm);
+        }
+
+        .stats-section,
+        .insights-section {
+            margin-bottom: var(--space-xl);
+        }
+
+        .section-title,
+        .section-header h2 {
+            font-size: 1.05rem;
+        }
+
+        .bento-header {
+            flex-wrap: wrap;
+            gap: var(--space-sm);
+        }
+
+        .bento-card,
+        .panel {
+            padding: var(--space-md);
+        }
+
+        /* Titles and their controls stack instead of squeezing. */
+        .panel-head {
+            flex-direction: column;
+            align-items: stretch;
+            gap: var(--space-sm);
+        }
+
+        .panel-controls {
+            justify-content: flex-start;
+        }
+
+        /* Status rows: label above the bars. */
+        .status-row {
+            grid-template-columns: 1fr;
+            gap: 6px;
+        }
+
+        .status-label {
+            white-space: normal;
+        }
+
+        .status-bars {
+            gap: 8px;
+        }
+
+        /* Charts get a little shorter and tighter. */
+        .trend-chart,
+        .hour-chart {
+            height: 120px;
+            gap: 3px;
+        }
+
+        .hour-axis {
+            gap: 3px;
+        }
+
+        /* Let wide data tables scroll horizontally with readable columns. */
+        table {
+            min-width: 720px;
+        }
+
+        .section-header {
+            align-items: flex-start;
+        }
     }
 </style>

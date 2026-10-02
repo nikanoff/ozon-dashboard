@@ -1,0 +1,56 @@
+{
+	"id": "/",
+	"name": "Ozon Seller Dashboard",
+	"short_name": "Ozon Dashboard",
+	"description": "Дашборд продавца Ozon: аналитика продаж, заказы и остатки в реальном времени.",
+	"lang": "ru",
+	"dir": "ltr",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"display_override": ["standalone", "minimal-ui"],
+	"orientation": "any",
+	"background_color": "#000000",
+	"theme_color": "#000000",
+	"categories": ["business", "productivity", "finance"],
+	"icons": [
+		{
+			"src": "/icons/icon-192.png",
+			"sizes": "192x192",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/icons/icon-512.png",
+			"sizes": "512x512",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/icons/maskable-192.png",
+			"sizes": "192x192",
+			"type": "image/png",
+			"purpose": "maskable"
+		},
+		{
+			"src": "/icons/maskable-512.png",
+			"sizes": "512x512",
+			"type": "image/png",
+			"purpose": "maskable"
+		}
+	],
+	"shortcuts": [
+		{
+			"name": "Дашборд",
+			"short_name": "Дашборд",
+			"url": "/",
+			"icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+		},
+		{
+			"name": "Остатки",
+			"short_name": "Остатки",
+			"url": "/stocks",
+			"icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+		}
+	]
+}

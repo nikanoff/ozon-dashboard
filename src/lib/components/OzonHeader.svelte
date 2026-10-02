@@ -1,6 +1,7 @@
 <script lang="ts">
     import OzonAuth from "./OzonAuth.svelte";
     import ChristmasDecoration from "./ChristmasDecoration.svelte";
+    import InstallPrompt from "./InstallPrompt.svelte";
     import { ozonKeys } from "$lib/stores/ozon_keys";
 
     interface Props {
@@ -54,6 +55,7 @@
             >
             {validating ? "Updating..." : "Refresh Data"}
         </button>
+        <InstallPrompt />
         <div class="status-badge" class:loading={validating}>
             <span class="pulse"></span>
             {validating ? "Validating..." : "Live"}
@@ -214,5 +216,35 @@
         display: flex;
         align-items: center;
         gap: var(--space-md);
+    }
+
+    @media (max-width: 720px) {
+        .header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: var(--space-md);
+            padding: var(--space-lg) 0;
+            margin-bottom: var(--space-xl);
+        }
+
+        .header-actions {
+            width: 100%;
+            flex-wrap: wrap;
+            gap: var(--space-sm);
+        }
+
+        .btn-refresh {
+            flex: 1 1 auto;
+            justify-content: center;
+            padding: 0.5rem 1rem;
+        }
+
+        .subtitle {
+            margin-top: 6px;
+        }
+
+        .nav-menu {
+            margin-top: 12px;
+        }
     }
 </style>

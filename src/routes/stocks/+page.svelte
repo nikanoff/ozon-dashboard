@@ -279,6 +279,8 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: var(--space-md);
+        flex-wrap: wrap;
         margin-bottom: var(--space-lg);
     }
 
@@ -530,5 +532,30 @@
     .product-thumb-placeholder {
         color: var(--text-disabled);
         opacity: 0.5;
+    }
+
+    /* --- Mobile / small-screen layout --- */
+    @media (max-width: 640px) {
+        .dashboard {
+            max-width: 100%;
+            padding: var(--space-md) var(--space-sm);
+        }
+
+        .card {
+            padding: var(--space-lg) var(--space-md);
+        }
+
+        .section-header h2 {
+            font-size: 1.05rem;
+        }
+
+        /* Keep columns readable and let the table scroll sideways. */
+        table {
+            min-width: 560px;
+        }
+
+        .product-info {
+            max-width: none;
+        }
     }
 </style>

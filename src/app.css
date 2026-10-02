@@ -61,6 +61,13 @@ body {
     -webkit-font-smoothing: antialiased;
     letter-spacing: -0.01em;
     overflow-x: hidden;
+    /* Keep content clear of the notch/status bar when installed as a PWA. */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    -webkit-text-size-adjust: 100%;
+}
+
+img {
+    max-width: 100%;
 }
 
 * {
