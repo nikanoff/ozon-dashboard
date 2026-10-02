@@ -12,19 +12,49 @@
 
     let deferred = $state<BeforeInstallPromptEvent | null>(null);
     let standalone = $state(false);
+    let isMobile = $state(false);
     let isIos = $state(false);
     let showIosHint = $state(false);
 
-    /** Show the button once the browser offers an install, or on iOS (manual flow). */
-    const canInstall = $derived(!standalone && (deferred !== null || isIos));
+    /**
+     * The button is for phones/tablets only, so it never shows on desktop Chrome
+     * and Edge, which fire the same beforeinstallprompt event.
+     */
+    const canInstall = $derived(
+        isMobile && !standalone && (deferred !== null || isIos),
+    );
+
+    /** iPadOS 13+ reports itself as macOS but is a touch-only tablet. */
+    function isIosDevice(): boolean {
+        const ua = navigator.userAgent;
+        return (
+            /iphone|ipad|ipod/i.test(ua) ||
+            (/macintosh/i.test(ua) && navigator.maxTouchPoints > 1)
+        );
+    }
+
+    function detectMobile(): boolean {
+        const { userAgentData } = navigator as Navigator & {
+            userAgentData?: { mobile?: boolean };
+        };
+        if (typeof userAgentData?.mobile === "boolean") return userAgentData.mobile;
+
+        return (
+            /android|iphone|ipad|ipod|iemobile|opera mini|mobile/i.test(
+                navigator.userAgent,
+            ) || isIosDevice()
+        );
+    }
 
     onMount(() => {
         standalone =
             window.matchMedia("(display-mode: standalone)").matches ||
             (navigator as Navigator & { standalone?: boolean }).standalone === true;
 
+        isMobile = detectMobile();
+
         // iOS Safari never fires beforeinstallprompt; there the install is manual.
-        isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+        isIos = isIosDevice();
 
         function onBeforeInstall(event: Event) {
             event.preventDefault();
