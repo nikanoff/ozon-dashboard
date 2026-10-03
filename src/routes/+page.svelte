@@ -11,7 +11,7 @@
         windowDays as accrualWindowDays,
         type AccrualCache,
     } from "$lib/accrual_cache";
-    import { summariseFinance, groupTotals, FEE_GROUP_LABELS, typeLabel } from "$lib/pnl";
+    import { summariseFinance, groupTotals, FEE_GROUP_LABELS } from "$lib/pnl";
     import {
         mergeDashboardPayload,
         needsFullLoad,

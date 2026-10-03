@@ -229,22 +229,6 @@ export function summariseDay(
     return summary;
 }
 
-/** Local calendar days between two dates, oldest first, inclusive, and capped. */
-export function daysBetween(from: Date, to: Date, limit = MAX_ACCRUAL_DAYS): string[] {
-    const days: string[] = [];
-    const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
-    const last = new Date(to.getFullYear(), to.getMonth(), to.getDate());
-
-    while (cursor <= last && days.length < limit) {
-        const month = String(cursor.getMonth() + 1).padStart(2, '0');
-        const day = String(cursor.getDate()).padStart(2, '0');
-        days.push(`${cursor.getFullYear()}-${month}-${day}`);
-        cursor.setDate(cursor.getDate() + 1);
-    }
-
-    return days;
-}
-
 /** Reads the `type_id` catalogue out of either documented response envelope. */
 export function toTypeCatalogue(raw: unknown): Record<string, string> {
     const response = (raw ?? {}) as {

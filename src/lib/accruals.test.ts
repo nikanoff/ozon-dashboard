@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
     collectFees,
-    daysBetween,
     readAmount,
     summariseDay,
     toAccrual,
@@ -264,35 +263,6 @@ describe('summariseDay', () => {
 
         expect(summary.net).toBe(50);
         expect(summary.byType).toEqual({ x: -100 });
-    });
-});
-
-describe('daysBetween', () => {
-    it('lists days inclusive, oldest first', () => {
-        expect(daysBetween(new Date(2026, 8, 14), new Date(2026, 8, 16))).toEqual([
-            '2026-09-14',
-            '2026-09-15',
-            '2026-09-16'
-        ]);
-    });
-
-    it('crosses a month boundary', () => {
-        expect(daysBetween(new Date(2026, 7, 31), new Date(2026, 8, 1))).toEqual([
-            '2026-08-31',
-            '2026-09-01'
-        ]);
-    });
-
-    it('returns a single day when the range is one day', () => {
-        expect(daysBetween(new Date(2026, 8, 16), new Date(2026, 8, 16))).toEqual(['2026-09-16']);
-    });
-
-    it('is empty when the range is inverted', () => {
-        expect(daysBetween(new Date(2026, 8, 16), new Date(2026, 8, 14))).toEqual([]);
-    });
-
-    it('respects the cap, so one request cannot walk a year', () => {
-        expect(daysBetween(new Date(2026, 0, 1), new Date(2026, 11, 31), 5)).toHaveLength(5);
     });
 });
 

@@ -1,6 +1,5 @@
 import { callOzonWithRetry, mapWithConcurrency, type Credentials } from './ozon';
 import {
-    daysBetween,
     summariseDay,
     toAccrual,
     toTypeCatalogue,
@@ -98,16 +97,6 @@ export async function collectAccrualDates(
             };
         }
     });
-}
-
-/** Fetches a window, one day per request. */
-export async function collectAccrualWindow(
-    credentials: Credentials,
-    from: Date,
-    to: Date,
-    signal?: AbortSignal
-): Promise<AccrualDaySummary[]> {
-    return collectAccrualDates(credentials, daysBetween(from, to), signal);
 }
 
 /**
