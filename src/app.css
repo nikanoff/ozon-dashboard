@@ -52,6 +52,17 @@
     --max-content-width: min(1600px, 90vw);
 }
 
+/*
+ * No horizontal panning, on either element.
+ *
+ * `overflow-x: hidden` on the body alone did not stop it: a wide child still made the document
+ * scrollable, and a phone could drag the page sideways, which also drags the fixed tap-to-top
+ * strip out of the viewport. Nothing here is sticky, so clipping the viewport costs nothing.
+ */
+html {
+    overflow-x: hidden;
+}
+
 body {
     margin: 0;
     font-family: var(--font-body);

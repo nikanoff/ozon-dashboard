@@ -4412,7 +4412,14 @@
         own label from `data-label`.
     */
     @media (max-width: 560px) {
-        .week-row {
+        /*
+            Two selectors, not one: `.breakdown-row` sets its own three-track template further
+            down this file, so a bare `.week-row` here would lose to it on source order and the
+            tracks' 460 px of minimums would push the page wider than a phone. The second
+            selector outweighs it on specificity instead.
+        */
+        .week-row,
+        .week-row.breakdown-row {
             grid-template-columns: 1fr;
             min-width: 0;
             gap: 3px;
@@ -4539,7 +4546,11 @@
         color: var(--text-muted);
     }
 
-    /* Breakdown of the accrued amount: three columns, so it needs no minimum width. */
+    /*
+        Breakdown of the accrued amount: a label, an amount and their composition. The two
+        flanking tracks may be narrow because the mobile block above collapses this row to one
+        column, where the minimums never apply.
+    */
     .breakdown-row {
         grid-template-columns: minmax(160px, 1.1fr) minmax(100px, 0.7fr) minmax(200px, 2fr);
         min-width: 0;
