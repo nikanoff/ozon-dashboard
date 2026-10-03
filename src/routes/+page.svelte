@@ -862,6 +862,16 @@
      */
     let scrollProgress = $state(0);
     let showToTop = $state(false);
+    /**
+     * Whether the strip along the top of the viewport should take taps.
+     *
+     * It stays inert while the header is still on screen: there the same strip would sit over
+     * the refresh and settings buttons and swallow them, and there is nothing above to scroll
+     * back to anyway. Past the header it is the only thing at the top of the viewport — which,
+     * on a phone in standalone mode, is the region iOS would otherwise use for its own
+     * tap-to-top gesture and does not.
+     */
+    let showTopStrip = $state(false);
 
     $effect(() => {
         const onScroll = () => {
@@ -870,6 +880,7 @@
 
             scrollProgress = scrollable > 0 ? Math.min(1, Math.max(0, scrolled / scrollable)) : 0;
             showToTop = scrolled > 600;
+            showTopStrip = scrolled > 140;
         };
 
         onScroll();
@@ -2740,6 +2751,18 @@
     {/if}
 
     <!--
+        Tap the top of the screen to go back up, the way a phone in standalone mode cannot do
+        for itself. Touch devices only, and inert until the header has scrolled away so it can
+        never intercept the buttons underneath it.
+    -->
+    <div
+        class="top-strip"
+        class:is-active={showTopStrip}
+        onclick={scrollToTop}
+        aria-hidden="true"
+    ></div>
+
+    <!--
         Back to the top, on a pointer device only. The ring is the page's own scroll position,
         so the control answers "how far down am I" as well as "take me up" — one element
         instead of a button plus a progress bar. Hidden below 768 px: a thumb flicks back
@@ -3863,6 +3886,33 @@
         display: flex;
         flex-direction: column;
         gap: 2px;
+    }
+
+    /*
+        The tap area along the top of the viewport, for touch only. Tall enough to catch a
+        thumb without aiming, and inert until the header is gone — see `showTopStrip`.
+    */
+    .top-strip {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 64px;
+        z-index: 45;
+        pointer-events: none;
+        /* No surface of its own: it is the screen's top edge, not a control on it. */
+        background: transparent;
+    }
+
+    .top-strip.is-active {
+        pointer-events: auto;
+    }
+
+    /* A mouse already has the ring, and clicking the page's top edge is not a gesture. */
+    @media (pointer: fine) {
+        .top-strip {
+            display: none;
+        }
     }
 
     /* --- Hourly activity --- */
