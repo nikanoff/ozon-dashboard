@@ -2,6 +2,7 @@ import { get } from 'svelte/store';
 import { ozonKeys } from './stores/ozon_keys';
 import type { DashboardPayload, StocksPayload } from './ozon_types';
 import type { AccrualDaySummary } from './accruals';
+import type { TurnoverRow } from './turnover';
 
 export interface OzonApiError extends Error {
     status: number;
@@ -98,4 +99,23 @@ export function getEconomicsData(
         dates,
         withTypes
     });
+}
+
+export interface TurnoverPayload {
+    rows: TurnoverRow[];
+    /** True when Ozon holds more rows than came back. */
+    truncated: boolean;
+    /** A refusal or failure, in which case `rows` is empty. */
+    error: string | null;
+    fetchedAt: string;
+}
+
+/**
+ * Ozon's turnover grades.
+ *
+ * Rate-limited to one request per minute upstream, so the caller is expected to cache and
+ * ask rarely.
+ */
+export function getTurnoverData(signal?: AbortSignal) {
+    return callBundle<TurnoverPayload>('/api/turnover', signal);
 }

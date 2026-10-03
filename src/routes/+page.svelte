@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { getDashboardData, getStocksData, getEconomicsData } from "$lib/ozon_api";
+    import { getDashboardData, getStocksData, getEconomicsData, getTurnoverData, type TurnoverPayload } from "$lib/ozon_api";
+    import { summariseTurnover, gradeLabel } from "$lib/turnover";
     import {
         cachedWindow,
         daysToFetch,
@@ -227,9 +228,11 @@
         resetDashboard();
         resetStocks();
         resetFinance();
+        resetTurnover();
         mutate({ force: true });
         mutateStocks({ force: true });
         mutateFinance({ force: true });
+        mutateTurnover({ force: true });
     });
 
     // Clean up resources when component is destroyed
@@ -414,6 +417,91 @@
     );
 
     let showCogs = $state(false);
+
+    // --- Ozon's own turnover report ---
+    //
+    // Limited upstream to one request per minute, so the answer is cached and asked for
+    // rarely. This is an enrichment: without it the dashboard still knows days of cover
+    // from its own postings-versus-stock estimate.
+    const TURNOVER_MIN_AGE_MS = 15 * 60 * 1000;
+
+    function turnoverStorageKey() {
+        return `ozon_turnover:${clientId}`;
+    }
+
+    function readTurnoverCache(): TurnoverPayload | null {
+        try {
+            const raw = localStorage.getItem(turnoverStorageKey());
+            if (!raw) return null;
+
+            const parsed = JSON.parse(raw) as TurnoverPayload;
+            if (!parsed || !Array.isArray(parsed.rows) || typeof parsed.fetchedAt !== "string") {
+                return null;
+            }
+
+            // A cached failure is not worth keeping: it would block a retry for minutes.
+            if (parsed.error) return null;
+
+            return parsed;
+        } catch {
+            return null;
+        }
+    }
+
+    function writeTurnoverCache(payload: TurnoverPayload) {
+        if (payload.error) return;
+        try {
+            localStorage.setItem(turnoverStorageKey(), JSON.stringify(payload));
+        } catch {
+            // Ignore quota.
+        }
+    }
+
+    const turnoverResult = useSWR(
+        `ozon-turnover:${clientId}`,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
+            }
+
+            const cached = readTurnoverCache();
+            if (cached) {
+                const age = Date.now() - Date.parse(cached.fetchedAt);
+                if (Number.isFinite(age) && age < TURNOVER_MIN_AGE_MS) return cached;
+            }
+
+            const payload = await getTurnoverData(signal);
+            writeTurnoverCache(payload);
+            return payload;
+        },
+        { dedupingInterval: 2000, refreshInterval: 60 * 60 * 1000 },
+    );
+
+    const {
+        data: turnoverData,
+        reset: resetTurnover,
+        mutate: mutateTurnover,
+        dispose: disposeTurnover,
+    } = turnoverResult;
+
+    onDestroy(disposeTurnover);
+
+    const turnover = $derived(summariseTurnover($turnoverData?.rows ?? []));
+
+    // Ozon reports turnover by SKU; the names come from the inventory rows.
+    const turnoverDeficit = $derived.by(() => {
+        const nameBySku = new Map(inventory.rows.map((row) => [row.sku, row.name]));
+
+        return turnover.deficit.slice(0, 8).map((row) => ({
+            sku: row.sku,
+            name: nameBySku.get(row.sku) ?? `SKU ${row.sku}`,
+            idc: row.idc,
+            grade: gradeLabel(row.grade),
+            cluster: gradeLabel(row.gradeCluster)
+        }));
+    });
 
     // --- Capital and priorities ---
     const capital = $derived(
@@ -1519,6 +1607,43 @@
                         {/each}
                     </div>
                 </div>
+            {/if}
+            {#if turnoverDeficit.length > 0}
+                <div class="panel glass-panel">
+                    <div class="panel-head">
+                        <span class="panel-title-group">
+                            <h3 class="panel-title">Дефицит по расчёту Ozon</h3>
+                            <InfoTip
+                                text="Оборачиваемость считает сам Ozon — по своей модели спроса, отдельно по каждому SKU. Здесь только те товары, которые Ozon помечает как дефицитные, с его оценкой запаса в днях. Метод доступен не чаще одного запроса в минуту, поэтому данные берутся из кэша браузера и обновляются редко."
+                                label="Пояснение к оборачиваемости Ozon"
+                            />
+                        </span>
+                        <div class="panel-controls">
+                            <span class="panel-note">
+                                {turnover.deficit.length} в дефиците
+                                {#if $turnoverData?.truncated}
+                                    · Ozon вернул не все строки
+                                {/if}
+                            </span>
+                        </div>
+                    </div>
+                    <div class="mini-list">
+                        {#each turnoverDeficit as row (row.sku)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={row.name}>{row.name}</span>
+                                <span class="mini-value">
+                                    {row.grade ?? "без оценки"}{#if row.idc !== null}
+                                        · {row.idc.toFixed(0)} дн.{/if}
+                                    {#if row.cluster}· {row.cluster}{/if}
+                                </span>
+                            </div>
+                        {/each}
+                    </div>
+                </div>
+            {:else if $turnoverData?.error}
+                <p class="muted-note">
+                    Оборачиваемость Ozon недоступна: {$turnoverData.error}
+                </p>
             {/if}
         {/if}
     </section>
