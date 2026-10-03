@@ -12,6 +12,8 @@
         navHref: string;
         navLabel: string;
         validating: boolean;
+        /** Message of the last failed load, if any. */
+        error?: string | null;
         onRefresh: () => void;
     }
 
@@ -22,8 +24,15 @@
         navHref,
         navLabel,
         validating,
+        error = null,
         onRefresh,
     }: Props = $props();
+
+    // The badge reports the state of the data, not just whether a request is in
+    // flight: claiming "Live" over a failed load is worse than saying nothing.
+    const statusText = $derived(
+        error ? "Failed" : validating ? "Updating…" : "Live",
+    );
 </script>
 
 <header class="header">
@@ -56,9 +65,15 @@
             {validating ? "Updating..." : "Refresh Data"}
         </button>
         <InstallPrompt />
-        <div class="status-badge" class:loading={validating}>
-            <span class="pulse"></span>
-            {validating ? "Validating..." : "Live"}
+        <div
+            class="status-badge"
+            class:loading={validating && !error}
+            class:failed={Boolean(error)}
+            role="status"
+            aria-live="polite"
+        >
+            <span class="pulse" aria-hidden="true"></span>
+            {statusText}
         </div>
         <OzonAuth />
     </div>
@@ -158,6 +173,16 @@
     .status-badge.loading {
         border-color: #333;
         color: #888;
+    }
+
+    .status-badge.failed {
+        border-color: rgba(239, 68, 68, 0.4);
+        color: #f87171;
+    }
+
+    /* A failure is not a heartbeat: stop the pulse so the badge reads as a state. */
+    .status-badge.failed .pulse {
+        animation: none;
     }
 
     .pulse {

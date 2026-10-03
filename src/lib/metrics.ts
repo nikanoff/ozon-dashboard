@@ -18,34 +18,51 @@ const dateKey = (date: Date) =>
         date.getDate()
     ).padStart(2, '0')}`;
 
-/** Revenue and order count over the half-open window `(from, to]`. */
+/**
+ * Revenue and order count over the half-open window `(from, to]`.
+ *
+ * The lower bound is exclusive so that two adjacent windows never both count a
+ * posting created exactly on their shared boundary, which would inflate the
+ * comparison. `revenue` includes cancellations, `netRevenue` does not, and
+ * `orders` counts only non-cancelled postings.
+ */
 function windowStats(
     postings: DashboardPosting[],
     from: Date,
     to: Date
-): { revenue: number; orders: number } {
+): { revenue: number; netRevenue: number; orders: number } {
     let revenue = 0;
+    let netRevenue = 0;
     let orders = 0;
 
     for (const posting of postings) {
         const createdAt = new Date(posting.created_at);
         if (Number.isNaN(createdAt.getTime())) continue;
-        if (createdAt < from || createdAt > to) continue;
+        if (createdAt <= from || createdAt > to) continue;
 
-        revenue += postingTotal(posting);
-        if (!isCancelled(posting)) orders += 1;
+        const total = postingTotal(posting);
+        revenue += total;
+
+        if (isCancelled(posting)) continue;
+        netRevenue += total;
+        orders += 1;
     }
 
-    return { revenue, orders };
+    return { revenue, netRevenue, orders };
 }
 
 export interface PeriodDelta {
+    /** Gross revenue, cancellations included. */
     revenue: number;
     previousRevenue: number;
+    /** Revenue without cancelled postings — the figure the dashboard headlines. */
+    netRevenue: number;
+    previousNetRevenue: number;
     orders: number;
     previousOrders: number;
     /** `null` when the previous window had no revenue to compare against. */
     revenueChangePct: number | null;
+    netRevenueChangePct: number | null;
     ordersChangePct: number | null;
 }
 
@@ -55,22 +72,23 @@ export interface WindowComparisons {
 }
 
 function toDelta(
-    current: { revenue: number; orders: number },
-    previous: { revenue: number; orders: number }
+    current: { revenue: number; netRevenue: number; orders: number },
+    previous: { revenue: number; netRevenue: number; orders: number }
 ): PeriodDelta {
+    /** Percentage growth, or `null` when there is no baseline to divide by. */
+    const change = (now: number, before: number) =>
+        before > 0 ? ((now - before) / before) * 100 : null;
+
     return {
         revenue: current.revenue,
         previousRevenue: previous.revenue,
+        netRevenue: current.netRevenue,
+        previousNetRevenue: previous.netRevenue,
         orders: current.orders,
         previousOrders: previous.orders,
-        revenueChangePct:
-            previous.revenue > 0
-                ? ((current.revenue - previous.revenue) / previous.revenue) * 100
-                : null,
-        ordersChangePct:
-            previous.orders > 0
-                ? ((current.orders - previous.orders) / previous.orders) * 100
-                : null
+        revenueChangePct: change(current.revenue, previous.revenue),
+        netRevenueChangePct: change(current.netRevenue, previous.netRevenue),
+        ordersChangePct: change(current.orders, previous.orders)
     };
 }
 
@@ -80,6 +98,11 @@ function toDelta(
  * Both "previous" windows fall inside the 31 days the dashboard loads, so the
  * comparison is always backed by data. A calendar-month comparison would need a
  * wider load, which is why it is not offered here.
+ *
+ * These are rolling windows (`now - N days` .. `now`), not calendar ones, and they
+ * report both gross and net revenue. The dashboard headlines the net figures so a
+ * delta always compares like with like: the hero card and the trend chart are net
+ * too.
  */
 export function compareWindows(
     postings: DashboardPosting[],

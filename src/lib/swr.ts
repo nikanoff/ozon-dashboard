@@ -18,12 +18,28 @@ export interface SWRResponse<T> {
     isValidating: Writable<boolean>;
     isLoading: Writable<boolean>;
     mutate: (options?: SWRMutateOptions) => Promise<void>;
+    /**
+     * Forgets this key entirely — cached payload, in-flight request and the
+     * stores the caller is reading — so the next `mutate` is a fresh first load.
+     */
+    reset: () => void;
     dispose: () => void;
 }
 
 const cache = new Map<string, any>();
 const lastFetch = new Map<string, number>();
-const inFlight = new Map<string, { promise: Promise<void>; controller: AbortController }>();
+
+interface InFlight {
+    promise: Promise<void>;
+    controller: AbortController;
+    /**
+     * Clears this request's in-progress flags. Called by the request itself and,
+     * when the entry is evicted mid-flight, by `reset`. Idempotent.
+     */
+    release: () => void;
+}
+
+const inFlight = new Map<string, InFlight>();
 
 /**
  * Reads the cached payload for a key without subscribing.
@@ -80,29 +96,69 @@ export function useSWR<T>(
         }
 
         const controller = new AbortController();
+        // Identifies this request, so a response that lands after `reset` evicted
+        // the entry is discarded instead of resurrecting the stale payload.
+        const entry: InFlight = {
+            controller,
+            promise: Promise.resolve(),
+            release: () => {
+                isValidating.set(false);
+                isLoading.set(false);
+            }
+        };
+        const isCurrent = () => inFlight.get(key) === entry;
+
         isValidating.set(true);
 
-        const promise = (async () => {
+        entry.promise = (async () => {
             try {
                 const result = await fetcher(controller.signal);
+                if (!isCurrent()) return;
+
                 cache.set(key, result);
                 lastFetch.set(key, Date.now());
                 data.set(result);
                 error.set(null);
             } catch (e) {
                 // An abort is a teardown, not a failure worth showing the user.
-                if (!isAbortError(e)) {
+                if (!isAbortError(e) && isCurrent()) {
                     error.set(e);
                 }
             } finally {
-                inFlight.delete(key);
-                isValidating.set(false);
-                isLoading.set(false);
+                // Only the live request owns the flags; after an eviction a newer
+                // request may already have claimed them.
+                if (isCurrent()) {
+                    inFlight.delete(key);
+                    entry.release();
+                }
             }
         })();
 
-        inFlight.set(key, { promise, controller });
-        await promise;
+        inFlight.set(key, entry);
+        await entry.promise;
+    }
+
+    /**
+     * Drops this key's payload and any request in flight for it, then puts the
+     * stores back into the "first load" state.
+     *
+     * The key is captured when the component mounts, so it cannot follow a
+     * credentials change on its own. Resetting is what keeps the account scoping
+     * honest at runtime: the payload of the previous account is discarded *before*
+     * the next request starts, so it can neither stay on screen nor be merged into
+     * the new account's data.
+     */
+    function reset() {
+        inFlight.get(key)?.controller.abort();
+        inFlight.delete(key);
+
+        cache.delete(key);
+        lastFetch.delete(key);
+
+        data.set(initialData);
+        error.set(null);
+        isValidating.set(false);
+        isLoading.set(true);
     }
 
     // Initial fetch
@@ -143,6 +199,7 @@ export function useSWR<T>(
         isValidating,
         isLoading,
         mutate,
+        reset,
         dispose
     };
 }

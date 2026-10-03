@@ -84,6 +84,7 @@
         navHref="/"
         navLabel="← Dashboard"
         validating={$isValidating}
+        error={error}
         onRefresh={() => mutate({ force: true })}
     />
 
@@ -140,7 +141,7 @@
                                 </tr>
                             {/each}
                         {:else if $stocksData && $stocksData.items}
-                            {#each $stocksData.items as item (item.product_id)}
+                            {#each $stocksData.items as item, index (`${item.product_id}-${index}`)}
                                 <tr
                                     class:highlighted={String(
                                         item.stocks?.[0]?.sku,
@@ -225,10 +226,17 @@
                                     >
                                 </tr>
                             {/each}
+                        {:else if error}
+                            <tr>
+                                <td colspan="5" class="empty"
+                                    >Данные не загружены — смотрите сообщение об
+                                    ошибке выше.</td
+                                >
+                            </tr>
                         {:else}
                             <tr>
-                                <td colspan="6" class="empty"
-                                    >No products found or API error.</td
+                                <td colspan="5" class="empty"
+                                    >Товаров нет.</td
                                 >
                             </tr>
                         {/if}

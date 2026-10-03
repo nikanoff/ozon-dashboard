@@ -42,7 +42,9 @@
     const cacheKey = `ozon-dashboard:${clientId}`;
 
     const swrResult = useSWR(
-        // Account-scoped key: cached data must not outlive a credentials change.
+        // Account-scoped key. The key itself is fixed for the lifetime of this
+        // component, so `refreshOnKeysChange` below resets both requests: that is
+        // what stops the previous account's payload from surviving a key change.
         cacheKey,
         async (signal) => {
             if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
@@ -76,6 +78,7 @@
         isLoading,
         isValidating,
         mutate,
+        reset: resetDashboard,
         dispose,
     } = swrResult;
 
@@ -95,12 +98,24 @@
         { dedupingInterval: 2000, refreshInterval: 5 * 60 * 1000 },
     );
 
-    const { data: stocksData, dispose: disposeStocks } = stocksResult;
+    const {
+        data: stocksData,
+        error: stocksError,
+        isLoading: stocksLoading,
+        mutate: mutateStocks,
+        reset: resetStocks,
+        dispose: disposeStocks,
+    } = stocksResult;
 
     // Reload when the credentials change; useSWR already loads the initial value.
+    // Both requests are reset first, so the previous account's payload is dropped
+    // before the new one is fetched — otherwise it would stay on screen and get
+    // merged into the new account's data.
     refreshOnKeysChange(() => {
+        resetDashboard();
+        resetStocks();
         mutate({ force: true });
-        stocksResult.mutate({ force: true });
+        mutateStocks({ force: true });
     });
 
     // Clean up resources when component is destroyed
@@ -137,6 +152,11 @@
 
     const pad = (value: number) => String(value).padStart(2, "0");
 
+    /** Wall-clock time of the payload currently on screen. */
+    function formatTime(date: Date) {
+        return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
     /** Short label for a posting status, falling back to the raw value. */
     const statusLabel = (status: string) => STATUS_LABELS[status] ?? status;
 
@@ -146,6 +166,18 @@
 
     const postingsData = $derived($dashboardData?.postings ?? []);
     const error = $derived($swrError?.message ?? null);
+
+    // The skeleton state owns the whole analytics area: without it every figure
+    // would render as a zero while the 31-day load is still running, which reads as
+    // "you sold nothing today".
+    const showSkeletons = $derived($isLoading);
+
+    // An error with nothing cached leaves nothing truthful to draw, so the sections
+    // are replaced by one explanation instead of a wall of zeros.
+    const nothingToShow = $derived(Boolean(error) && postingsData.length === 0);
+
+    // Stale-but-present data: the last refresh failed, so what is on screen is old.
+    const showingStaleData = $derived(Boolean(error) && postingsData.length > 0);
 
     // Recomputed whenever the postings change.
     const stats = $derived(calculateStats(postingsData));
@@ -195,6 +227,17 @@
 
     // --- Tier 3: joins sales with the stock rows loaded above ---
     const stockRows = $derived($stocksData?.items ?? []);
+    const stocksLoadError = $derived($stocksError?.message ?? null);
+
+    // Three distinct states, never collapsed into one: still loading, failed, or
+    // genuinely empty. Collapsing them is what made a failed request look like
+    // "there is no stock at all".
+    const stocksLoadingNow = $derived($stocksLoading);
+    const stocksFailed = $derived(stocksLoadError !== null && stockRows.length === 0);
+    const stocksEmpty = $derived(
+        !$stocksLoading && stocksLoadError === null && stockRows.length === 0,
+    );
+
     // Without stock rows every selling SKU would look out of stock, so the join is
     // only run once the inventory payload has arrived.
     const inventory = $derived(
@@ -227,6 +270,21 @@
             currentPage * itemsPerPage,
         ),
     );
+
+    // A refresh can shrink the history, which would otherwise strand the reader on a
+    // page that no longer exists — "Page 12 of 8" above an empty table.
+    $effect(() => {
+        const lastPage = Math.max(1, totalPages);
+        if (currentPage > lastPage) currentPage = lastPage;
+    });
+
+    // Timestamp of the payload currently on screen, so the reader can tell whether
+    // the figures are five seconds or five hours old.
+    let lastUpdated = $state<Date | null>(null);
+    $effect(() => {
+        const payload = $dashboardData;
+        if (payload) lastUpdated = new Date();
+    });
 
     const statsConfig = $derived([
         {
@@ -289,11 +347,12 @@
         navHref="/stocks"
         navLabel="View Stocks →"
         validating={$isValidating}
+        error={error}
         onRefresh={() => mutate({ force: true })}
     />
 
     {#if error}
-        <div class="error-card">
+        <div class="error-card" role="alert">
             <svg
                 viewBox="0 0 24 24"
                 width="24"
@@ -301,6 +360,7 @@
                 stroke="currentColor"
                 fill="none"
                 stroke-width="2"
+                aria-hidden="true"
                 ><circle cx="12" cy="12" r="10" /><line
                     x1="12"
                     y1="8"
@@ -308,22 +368,87 @@
                     y2="12"
                 /><line x1="12" y1="16" x2="12.01" y2="16" /></svg
             >
-            <p>{error}</p>
+            <div class="error-text">
+                <p>{error}</p>
+                {#if showingStaleData}
+                    <p class="error-note">
+                        На экране данные, полученные ранее{lastUpdated
+                            ? ` (в ${formatTime(lastUpdated)})`
+                            : ""}: обновить их не удалось.
+                    </p>
+                {/if}
+            </div>
+            <button
+                type="button"
+                class="btn-retry"
+                onclick={() => mutate({ force: true })}
+                disabled={$isValidating}
+            >
+                {$isValidating ? "Обновляем…" : "Повторить"}
+            </button>
         </div>
     {/if}
 
-    <section class="stats-section">
+    {#if nothingToShow}
+        <div class="panel glass-panel no-data">
+            <p>Данные не загружены, поэтому показывать нечего.</p>
+            <p class="muted-note">
+                Исправьте доступы (шестерёнка справа сверху) или повторите загрузку
+                кнопкой выше.
+            </p>
+        </div>
+    {:else}
+    <section class="stats-section" aria-busy={showSkeletons}>
         <div class="bento-header">
             <h2 class="section-title">Performance Analytics</h2>
+            <InfoTip
+                text="Шесть окон сразу: календарные (с 00:00 сегодня, с понедельника, с 1-го числа) и скользящие (последние 24 часа / 7 / 31 день от текущего момента). Большое число в каждой карточке — выручка без отменённых заказов, строка Gross — до вычетов."
+                label="Пояснение к периодам"
+            />
+            <span class="updated-at" role="status" aria-live="polite">
+                {#if showSkeletons}
+                    загрузка данных…
+                {:else if lastUpdated}
+                    данные загружены в {formatTime(lastUpdated)}
+                {:else}
+                    нет данных
+                {/if}
+            </span>
         </div>
 
         <div class="bento-grid">
+            {#if showSkeletons}
+                <!-- Same six grid children in the same order, so the areas line up. -->
+                <div class="bento-card hero-card glass-panel">
+                    <span class="skeleton sk-hero"></span>
+                    <span class="skeleton sk-line"></span>
+                </div>
+                <div class="bento-card medium-card glass-panel">
+                    <span class="skeleton sk-medium"></span>
+                    <span class="skeleton sk-line"></span>
+                </div>
+                <div class="bento-card medium-card glass-panel">
+                    <span class="skeleton sk-medium"></span>
+                    <span class="skeleton sk-line"></span>
+                </div>
+                {#each [1, 2, 3] as card (card)}
+                    <div class="bento-card small-card glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-small"></span>
+                    </div>
+                {/each}
+            {:else}
             <!-- Hero Card: Calendar Day -->
             <div class="bento-card hero-card glass-panel glow-effect">
                 <div class="card-content">
                     <div class="card-header">
                         <span class="bento-label">Calendar Day</span>
-                        <span class="live-indicator"></span>
+                        <span
+                            class="live-indicator"
+                            class:busy={$isValidating}
+                            class:stale={showingStaleData}
+                            aria-hidden="true"
+                        ></span>
                     </div>
                     <div class="card-main-value">
                         <span class="currency-symbol">₽</span>
@@ -333,7 +458,7 @@
                                 .replace("₽", "")
                                 .trim()}</span
                         >
-                        <div class="main-label">Net Sales</div>
+                        <div class="main-label">Net Sales · без отмен</div>
                     </div>
                     <div class="card-sub-stats">
                         <div class="sub-stat">
@@ -387,7 +512,7 @@
                             >
                         </div>
                         <div class="mini-row">
-                            <span class="mini-label">Gross:</span>
+                            <span class="mini-label">Gross (с отменами):</span>
                             <span class="mini-value"
                                 >{formatCurrency(stats.calendarWeek.sum)}</span
                             >
@@ -428,7 +553,7 @@
                             >
                         </div>
                         <div class="mini-row">
-                            <span class="mini-label">Gross:</span>
+                            <span class="mini-label">Gross (с отменами):</span>
                             <span class="mini-value"
                                 >{formatCurrency(stats.calendarMonth.sum)}</span
                             >
@@ -464,7 +589,7 @@
                         Orders: {stats.last24h.count}
                     </div>
                     <div class="micro-stat">
-                        Gross: {formatCurrency(stats.last24h.sum)}
+                        Gross (с отменами): {formatCurrency(stats.last24h.sum)}
                     </div>
                     {#if stats.last24h.cancelled > 0}
                         <div class="micro-stat text-error">
@@ -489,7 +614,7 @@
                         Orders: {stats.last7d.count}
                     </div>
                     <div class="micro-stat">
-                        Gross: {formatCurrency(stats.last7d.sum)}
+                        Gross (с отменами): {formatCurrency(stats.last7d.sum)}
                     </div>
                     {#if stats.last7d.cancelled > 0}
                         <div class="micro-stat text-error">
@@ -514,7 +639,7 @@
                         Orders: {stats.last31d.count}
                     </div>
                     <div class="micro-stat">
-                        Gross: {formatCurrency(stats.last31d.sum)}
+                        Gross (с отменами): {formatCurrency(stats.last31d.sum)}
                     </div>
                     {#if stats.last31d.cancelled > 0}
                         <div class="micro-stat text-error">
@@ -524,6 +649,7 @@
                     {/if}
                 </div>
             </div>
+            {/if}
         </div>
     </section>
 
@@ -531,43 +657,52 @@
         <div class="bento-header">
             <h2 class="section-title">Ключевые показатели · текущий месяц</h2>
             <InfoTip
-                text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Динамика 24ч/7д сравнивается с предыдущими сутками и неделей."
+                text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Два последних чипа — скользящие окна 24 часа и 7 дней (не календарные) и тоже без отмен, чтобы сравнивать с главным числом дашборда."
                 label="Пояснение к ключевым показателям"
             />
         </div>
         <div class="kpi-strip">
-            {#each derivedMetrics as metric (metric.label)}
+            {#if showSkeletons}
+                {#each [1, 2, 3, 4, 5, 6, 7, 8] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            {:else}
+                {#each derivedMetrics as metric (metric.label)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="kpi-label">{metric.label}</span>
+                        <span class="kpi-value">{metric.value}</span>
+                    </div>
+                {/each}
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">{metric.label}</span>
-                    <span class="kpi-value">{metric.value}</span>
+                    <span class="kpi-label">Чистая выручка · 24ч</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(deltas.last24h.netRevenue)}</span
+                    >
+                    <span
+                        class="kpi-delta"
+                        class:positive={isUp(deltas.last24h.netRevenueChangePct)}
+                        class:negative={isDown(deltas.last24h.netRevenueChangePct)}
+                        >{formatDelta(deltas.last24h.netRevenueChangePct)} к
+                        предыдущим 24ч</span
+                    >
                 </div>
-            {/each}
-            <div class="kpi-chip glass-panel">
-                <span class="kpi-label">Выручка за 24ч</span>
-                <span class="kpi-value"
-                    >{formatCurrency(deltas.last24h.revenue)}</span
-                >
-                <span
-                    class="kpi-delta"
-                    class:positive={isUp(deltas.last24h.revenueChangePct)}
-                    class:negative={isDown(deltas.last24h.revenueChangePct)}
-                    >{formatDelta(deltas.last24h.revenueChangePct)} к пред.
-                    суткам</span
-                >
-            </div>
-            <div class="kpi-chip glass-panel">
-                <span class="kpi-label">Выручка за 7 дней</span>
-                <span class="kpi-value"
-                    >{formatCurrency(deltas.last7d.revenue)}</span
-                >
-                <span
-                    class="kpi-delta"
-                    class:positive={isUp(deltas.last7d.revenueChangePct)}
-                    class:negative={isDown(deltas.last7d.revenueChangePct)}
-                    >{formatDelta(deltas.last7d.revenueChangePct)} к пред.
-                    неделе</span
-                >
-            </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Чистая выручка · 7 дней</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(deltas.last7d.netRevenue)}</span
+                    >
+                    <span
+                        class="kpi-delta"
+                        class:positive={isUp(deltas.last7d.netRevenueChangePct)}
+                        class:negative={isDown(deltas.last7d.netRevenueChangePct)}
+                        >{formatDelta(deltas.last7d.netRevenueChangePct)} к
+                        предыдущим 7 дням</span
+                    >
+                </div>
+            {/if}
         </div>
 
         <div class="panel glass-panel trend-panel">
@@ -584,23 +719,28 @@
                     <RangeToggle bind:value={windowDays} />
                 </div>
             </div>
-            <div class="trend-chart">
-                {#each trend as point (point.date)}
-                    <div
-                        class="trend-bar-wrap"
-                        title="{point.date}: {formatCurrency(point.netRevenue)} · {point.orders} заказов"
-                    >
+            {#if showSkeletons}
+                <div class="sk-chart" aria-hidden="true"></div>
+            {:else}
+                <div class="trend-chart">
+                    {#each trend as point (point.date)}
                         <div
-                            class="trend-bar"
-                            style="height: {Math.max(2, Math.round((point.netRevenue / trendMax) * 100))}%"
-                        ></div>
-                    </div>
-                {/each}
-            </div>
-            <div class="trend-axis">
-                <span>{trend[0]?.date ?? ""}</span>
-                <span>{trend.at(-1)?.date ?? ""}</span>
-            </div>
+                            class="trend-bar-wrap"
+                            title="{point.date}: {formatCurrency(point.netRevenue)} · {point.orders} заказов"
+                        >
+                            <div
+                                class="trend-bar"
+                                class:is-empty={point.netRevenue <= 0}
+                                style="height: {Math.max(2, Math.round((point.netRevenue / trendMax) * 100))}%"
+                            ></div>
+                        </div>
+                    {/each}
+                </div>
+                <div class="trend-axis">
+                    <span>{trend[0]?.date ?? ""}</span>
+                    <span>{trend.at(-1)?.date ?? ""}</span>
+                </div>
+            {/if}
         </div>
     </section>
 
@@ -630,29 +770,35 @@
                     <RangeToggle bind:value={windowDays} />
                 </div>
             </div>
-            <div class="hour-chart">
-                {#each hours as point (point.hour)}
-                    <div
-                        class="hour-col"
-                        title="{pad(point.hour)}:00 — {point.orders} заказов, {formatCurrency(
-                            point.revenue,
-                        )}"
-                    >
+            {#if showSkeletons}
+                <div class="sk-chart" aria-hidden="true"></div>
+            {:else}
+                <div class="hour-chart">
+                    {#each hours as point (point.hour)}
                         <div
-                            class="hour-bar"
-                            class:peak={point.hour === peakHour.hour && point.orders > 0}
-                            style="height: {point.orders === 0
-                                ? 2
-                                : Math.max(4, Math.round((point.orders / hoursMax) * 100))}%"
-                        ></div>
-                    </div>
-                {/each}
-            </div>
-            <div class="hour-axis">
-                {#each hours as point (point.hour)}
-                    <span>{point.hour % 3 === 0 ? pad(point.hour) : ""}</span>
-                {/each}
-            </div>
+                            class="hour-col"
+                            title="{pad(point.hour)}:00 — {point.orders} заказов, {formatCurrency(
+                                point.revenue,
+                            )}"
+                        >
+                            <div
+                                class="hour-bar"
+                                class:peak={point.hour === peakHour.hour &&
+                                    point.orders > 0}
+                                class:is-empty={point.orders === 0}
+                                style="height: {point.orders === 0
+                                    ? 2
+                                    : Math.max(4, Math.round((point.orders / hoursMax) * 100))}%"
+                            ></div>
+                        </div>
+                    {/each}
+                </div>
+                <div class="hour-axis">
+                    {#each hours as point (point.hour)}
+                        <span>{point.hour % 3 === 0 ? pad(point.hour) : ""}</span>
+                    {/each}
+                </div>
+            {/if}
         </div>
 
         <div class="breakdown-grid">
@@ -664,7 +810,9 @@
                         label="Пояснение к топу товаров"
                     />
                 </span>
-                {#if top.length === 0}
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if top.length === 0}
                     <p class="muted-note">Нет продаж за период.</p>
                 {:else}
                     <div class="top-list">
@@ -717,7 +865,9 @@
                         label="Пояснение к географии"
                     />
                 </span>
-                {#if cities.length === 0}
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if cities.length === 0}
                     <p class="muted-note">Нет данных.</p>
                 {:else}
                     <div class="mini-list">
@@ -747,7 +897,9 @@
                         label="Пояснение к способам оплаты"
                     />
                 </span>
-                {#if payments.length === 0}
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if payments.length === 0}
                     <p class="muted-note">Нет данных.</p>
                 {:else}
                     <div class="mini-list">
@@ -779,7 +931,9 @@
                         label="Пояснение к маршрутам кластеров"
                     />
                 </span>
-                {#if routes.length === 0}
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if routes.length === 0}
                     <p class="muted-note">Нет данных.</p>
                 {:else}
                     <div class="mini-list">
@@ -805,7 +959,9 @@
                         label="Пояснение к акциям и тегам"
                     />
                 </span>
-                {#if actionStats.length === 0}
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if actionStats.length === 0}
                     <p class="muted-note">Заказы без тегов.</p>
                 {:else}
                     <div class="mini-list">
@@ -838,10 +994,29 @@
             />
         </div>
 
-        {#if stockRows.length === 0}
-            <div class="panel glass-panel muted-note">
-                Остатки не загружены: оборачиваемость появится, когда придут данные
-                со страницы остатков.
+        {#if stocksLoadingNow}
+            <div class="kpi-strip" aria-hidden="true">
+                {#each [1, 2, 3, 4, 5, 6] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            </div>
+        {:else if stocksFailed}
+            <div class="panel glass-panel state-note" role="alert">
+                <p>Остатки загрузить не удалось: {stocksLoadError}</p>
+                <button
+                    type="button"
+                    class="btn-retry"
+                    onclick={() => mutateStocks({ force: true })}
+                >
+                    Повторить
+                </button>
+            </div>
+        {:else if stocksEmpty}
+            <div class="panel glass-panel state-note">
+                <p>Остатков нет: Ozon не вернул ни одной строки FBO.</p>
             </div>
         {:else}
             <div class="kpi-strip">
@@ -983,7 +1158,7 @@
                             {/each}
                         {:else if paginatedPostings.length > 0}
                             {#each paginatedPostings as posting (posting.posting_number)}
-                                {#each posting.products as product, i (product.sku || product.name)}
+                                {#each posting.products as product, i (`${product.sku || product.name}-${i}`)}
                                     <tr>
                                         {#if i === 0}
                                             <td
@@ -1144,7 +1319,7 @@
                         {:else}
                             <tr>
                                 <td colspan="8" class="empty"
-                                    >No orders found.</td
+                                    >За этот период заказов нет.</td
                                 >
                             </tr>
                         {/if}
@@ -1153,6 +1328,7 @@
             </div>
         </div>
     </section>
+    {/if}
 </div>
 
 <style>
@@ -2266,5 +2442,147 @@
         .section-header {
             align-items: flex-start;
         }
+    }
+
+    /* --- Loading, empty and error states --- */
+
+    /* Timestamp of the payload on screen; announced politely when it changes. */
+    .updated-at {
+        margin-left: auto;
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+
+    .live-indicator.busy {
+        animation: dot-pulse 1.4s ease-in-out infinite;
+    }
+
+    /* Stale data is not "live": say so in colour, not only in a tooltip. */
+    .live-indicator.stale {
+        background: var(--warning);
+        box-shadow: 0 0 8px var(--warning);
+    }
+
+    @keyframes dot-pulse {
+        0%,
+        100% {
+            opacity: 1;
+            transform: scale(1);
+        }
+        50% {
+            opacity: 0.35;
+            transform: scale(1.35);
+        }
+    }
+
+    /* Placeholder shapes. Sizes mirror the content they stand in for, so the
+       layout does not jump when the numbers arrive. */
+    .sk-hero {
+        height: 3.5rem;
+        width: 70%;
+        margin-bottom: var(--space-md);
+    }
+
+    .sk-medium {
+        height: 2rem;
+        width: 60%;
+        margin: var(--space-sm) 0;
+    }
+
+    .sk-small {
+        height: 1.5rem;
+        width: 55%;
+        margin-top: 8px;
+    }
+
+    .sk-line {
+        height: 0.7rem;
+        width: 45%;
+    }
+
+    .sk-chip {
+        height: 1.3rem;
+        width: 65%;
+    }
+
+    /* One block standing in for a whole chart or list. */
+    .sk-chart {
+        height: 120px;
+        border-radius: var(--radius-sm);
+        background: var(--border-subtle);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .sk-chart::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(
+            90deg,
+            transparent,
+            rgba(255, 255, 255, 0.05),
+            transparent
+        );
+        animation: shimmer 1.5s infinite;
+    }
+
+    /* A day/hour with no sales keeps a hairline marker but stops reading as a bar. */
+    .trend-bar.is-empty,
+    .hour-bar.is-empty {
+        background: rgba(255, 255, 255, 0.12);
+    }
+
+    .error-text {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+
+    .error-text p {
+        margin: 0;
+    }
+
+    .error-note {
+        margin-top: 4px !important;
+        font-size: 0.75rem;
+        color: var(--text-muted);
+    }
+
+    .btn-retry {
+        flex: 0 0 auto;
+        background: transparent;
+        border: 1px solid var(--border-hover);
+        color: var(--text-primary);
+        padding: 0.5rem 1rem;
+        min-height: 36px;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+
+    .btn-retry:hover:not(:disabled) {
+        background: rgba(255, 255, 255, 0.06);
+    }
+
+    .btn-retry:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+    }
+
+    .no-data,
+    .state-note {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: var(--space-sm);
+    }
+
+    .no-data p,
+    .state-note p {
+        margin: 0;
     }
 </style>

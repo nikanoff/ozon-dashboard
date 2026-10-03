@@ -257,4 +257,44 @@ describe('compareWindows', () => {
         expect(comparison.last7d.previousRevenue).toBe(0);
         expect(comparison.last7d.revenueChangePct).toBeNull();
     });
+
+    it('reports net revenue next to gross so both readings are available', () => {
+        const comparison = compareWindows(
+            [
+                hoursAgo(2),
+                hoursAgo(3, { status: 'cancelled' })
+            ],
+            NOW
+        );
+
+        // Gross keeps the cancelled posting, net drops it.
+        expect(comparison.last24h.revenue).toBe(200);
+        expect(comparison.last24h.netRevenue).toBe(100);
+        expect(comparison.last24h.orders).toBe(1);
+    });
+
+    it('never counts one posting in two adjacent windows', () => {
+        // Exactly on the shared boundary of the current and previous 24h windows.
+        const onBoundary = new Date(NOW.getTime() - 24 * HOUR);
+
+        const comparison = compareWindows([{ ...posting(), created_at: onBoundary.toISOString() }], NOW);
+
+        expect(comparison.last24h.previousRevenue).toBe(100);
+        expect(comparison.last24h.revenue).toBe(0);
+    });
+
+    it('derives the net change from the previous net revenue', () => {
+        const comparison = compareWindows(
+            [
+                hoursAgo(2, { products: [{ offer_id: 'a', sku: 1, quantity: 1, price: { amount: '300', currency: 'RUB' } }] }),
+                // Previous window: 100 net plus a cancellation that must not count.
+                hoursAgo(30),
+                hoursAgo(31, { status: 'cancelled' })
+            ],
+            NOW
+        );
+
+        expect(comparison.last24h.previousNetRevenue).toBe(100);
+        expect(comparison.last24h.netRevenueChangePct).toBeCloseTo(200);
+    });
 });
