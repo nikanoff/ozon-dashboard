@@ -26,7 +26,18 @@ const rawPosting: OzonPosting = {
         cluster_from: 'Ярославль',
         cluster_to: 'Москва',
         products: [
-            { actions: ['Обработка отправления'] },
+            {
+                product_id: 42,
+                payout: 1400.5,
+                commission_amount: 298.5,
+                commission_percent: 17.6,
+                price: 1699,
+                old_price: 2199,
+                total_discount_value: 500,
+                total_discount_percent: 22.7,
+                currency_code: 'RUB',
+                actions: ['Обработка отправления']
+            },
             { actions: ['Сборка заказа', 'Обработка отправления'] }
         ]
     }
@@ -54,13 +65,41 @@ describe('toDashboardPosting', () => {
         });
     });
 
-    it('drops the heavy financial_data.products and flattens its actions', () => {
+    it('keeps the money fields and flattens the actions', () => {
         const posting = toDashboardPosting(rawPosting);
 
         expect(posting.financial_data).toEqual({
             cluster_from: 'Ярославль',
             cluster_to: 'Москва'
         });
+        // Payout and commission are the seller's actual money; dropping them here
+        // was what made the dashboard show revenue instead of earnings.
+        expect(posting.financial_products).toEqual([
+            {
+                product_id: 42,
+                payout: 1400.5,
+                commission_amount: 298.5,
+                commission_percent: 17.6,
+                price: 1699,
+                old_price: 2199,
+                total_discount_value: 500,
+                total_discount_percent: 22.7,
+                currency_code: 'RUB',
+                actions: ['Обработка отправления']
+            },
+            {
+                product_id: undefined,
+                payout: undefined,
+                commission_amount: undefined,
+                commission_percent: undefined,
+                price: undefined,
+                old_price: undefined,
+                total_discount_value: undefined,
+                total_discount_percent: undefined,
+                currency_code: undefined,
+                actions: ['Сборка заказа', 'Обработка отправления']
+            }
+        ]);
         expect(posting.actions).toEqual(['Обработка отправления', 'Сборка заказа']);
     });
 
@@ -74,6 +113,7 @@ describe('toDashboardPosting', () => {
 
         expect(posting.analytics_data).toBeUndefined();
         expect(posting.financial_data).toBeUndefined();
+        expect(posting.financial_products).toEqual([]);
         expect(posting.actions).toEqual([]);
         expect(posting.products).toEqual([]);
     });

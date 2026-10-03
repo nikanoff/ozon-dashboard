@@ -27,6 +27,7 @@ function posting(overrides: Partial<DashboardPosting> = {}): DashboardPosting {
         products: [
             { offer_id: 'offer', sku: 1, quantity: 1, price: { amount: '100', currency: 'RUB' } }
         ],
+        financial_products: [],
         actions: [],
         ...overrides
     };

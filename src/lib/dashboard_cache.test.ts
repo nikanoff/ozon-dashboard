@@ -16,6 +16,7 @@ function posting(postingNumber: string, createdAt: string, status = 'delivered')
         created_at: createdAt,
         status,
         products: [],
+        financial_products: [],
         actions: []
     };
 }

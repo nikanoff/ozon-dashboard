@@ -45,6 +45,36 @@ export interface OzonPostingProduct {
     price?: OzonPrice | string;
 }
 
+/**
+ * One row of `financial_data.products[]`.
+ *
+ * This is the only place the free tier exposes money the seller actually keeps:
+ * `payout` and `commission_amount` come straight from Ozon, so unit economics does
+ * not need a paid method. The fields are declared as they appear in the v2 docs;
+ * v3 is expected to match, which the first live call has to confirm.
+ *
+ * Known defect: `quantity` here is unreliable — some FBO postings omit it or send
+ * `"0\""`. Always take the quantity from the top-level `products[]` instead.
+ */
+export interface OzonFinancialProduct {
+    /** Matches `products[].sku` in the documented example, but not guaranteed to. */
+    product_id?: number;
+    /** What the seller receives for this line, per the order card. */
+    payout?: number;
+    /** Commission Ozon keeps, in currency units. */
+    commission_amount?: number;
+    /** Effective commission rate for this line, in percent. */
+    commission_percent?: number;
+    /** Line price and the price before discount. */
+    price?: number;
+    old_price?: number;
+    /** How much of the price was given away by discounts. */
+    total_discount_value?: number;
+    total_discount_percent?: number;
+    currency_code?: string;
+    actions?: string[];
+}
+
 export interface OzonPosting {
     posting_number: string;
     order_number?: string;
@@ -60,7 +90,7 @@ export interface OzonPosting {
     financial_data?: {
         cluster_from?: string;
         cluster_to?: string;
-        products?: { actions?: string[] }[];
+        products?: OzonFinancialProduct[];
     };
 }
 
@@ -117,6 +147,17 @@ export interface DashboardPosting {
         cluster_from?: string;
         cluster_to?: string;
     };
+    /**
+     * `financial_data.products[]`, kept in its own array rather than merged into
+     * `products[]`.
+     *
+     * The two arrays describe the same lines but key them differently — the posting
+     * carries `sku`, the financial row carries `product_id` — and the financial one
+     * has a known gap in `quantity`. Merging them on the server would bake a guess
+     * into the wire format, so the join happens in `$lib/economics.ts`, where it is
+     * explicit and covered by tests.
+     */
+    financial_products: OzonFinancialProduct[];
     /** Flattened, de-duplicated `financial_data.products[].actions`. */
     actions: string[];
 }

@@ -31,6 +31,7 @@
         topProducts,
     } from "$lib/metrics";
     import { inventoryInsights } from "$lib/inventory";
+    import { moneySummary, enrichLines } from "$lib/economics";
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import OzonHeader from "$lib/components/OzonHeader.svelte";
     import InfoTip from "$lib/components/InfoTip.svelte";
@@ -246,6 +247,24 @@
             : inventoryInsights([], []),
     );
 
+    // --- Money, as opposed to revenue ---
+    //
+    // Ozon reports `payout` and `commission_amount` inside `financial_data` of the
+    // same free endpoint the orders come from, so unit economics needs no paid
+    // method. Cancelled orders earn nothing, hence they are left out.
+    const MONEY_WINDOW_DAYS = 31;
+    const paidPostings = $derived(
+        postingsData.filter((posting) => posting.status !== "cancelled"),
+    );
+    const moneyWindow = $derived.by(() => {
+        const since = Date.now() - MONEY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+        return paidPostings.filter((posting) => {
+            const createdAt = new Date(posting.created_at).getTime();
+            return Number.isFinite(createdAt) && createdAt >= since;
+        });
+    });
+    const money = $derived(moneySummary(moneyWindow));
+
     // Dynamic title for the browser tab, showing today's net sales once there are any.
     const pageTitle = $derived(
         stats.calendarDay.netSum > 0
@@ -268,6 +287,17 @@
         sortedPostings.slice(
             (currentPage - 1) * itemsPerPage,
             currentPage * itemsPerPage,
+        ),
+    );
+
+    // Money per posting line for the orders table. Computed once per page instead of
+    // per cell, because the join walks every line of the posting.
+    const rowMoneyByPosting = $derived(
+        new Map(
+            paginatedPostings.map((posting) => [
+                posting.posting_number,
+                enrichLines(posting),
+            ]),
         ),
     );
 
@@ -452,17 +482,19 @@
                     </div>
                     <div class="card-main-value">
                         <span class="currency-symbol">₽</span>
-                        <!-- Main: Net Sales (Total with cancellations) -->
                         <span class="diamond-text text-xl"
                             >{formatCurrency(stats.calendarDay.netSum)
                                 .replace("₽", "")
                                 .trim()}</span
                         >
-                        <div class="main-label">Net Sales · без отмен</div>
+                        <!-- This is the seller's price, i.e. what the buyer pays. It is
+                             not what reaches the account; the money block below says
+                             how much Ozon keeps. -->
+                        <div class="main-label">Выручка продавца · без отмен</div>
                     </div>
                     <div class="card-sub-stats">
                         <div class="sub-stat">
-                            <span class="sub-label">Gross Sales</span>
+                            <span class="sub-label">С отменами</span>
                             <span class="sub-value"
                                 >{formatCurrency(stats.calendarDay.sum)}</span
                             >
@@ -655,6 +687,80 @@
 
     <section class="insights-section">
         <div class="bento-header">
+            <h2 class="section-title">Деньги · последние 31 день</h2>
+            <InfoTip
+                text="Что из выручки забирает Ozon и что остаётся продавцу. Комиссия и её фактическая ставка — из финансовых данных заказа, это точные суммы. «Остаётся продавцу» — payout из карточки заказа (цена минус комиссия); логистика, обработка отправления и эквайринг в него могут не входить, поэтому это ещё не сумма к выплате на счёт. Точное «к перечислению» появится, когда подключим финансовый слой Ozon. Отменённые заказы не учитываются."
+                label="Пояснение к деньгам"
+            />
+        </div>
+        <div class="kpi-strip">
+            {#if showSkeletons}
+                {#each [1, 2, 3, 4, 5, 6] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            {:else}
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Выручка продавца</span>
+                    <span class="kpi-value">{formatCurrency(money.gross)}</span>
+                    <span class="kpi-delta">цена покупателя, без отмен</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Комиссия Ozon</span>
+                    <span class="kpi-value">{formatCurrency(money.commission)}</span>
+                    <span class="kpi-delta"
+                        >факт. ставка
+                        {money.commissionRate === null
+                            ? "—"
+                            : formatPercent(money.commissionRate * 100)}</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Остаётся продавцу</span>
+                    <span class="kpi-value">{formatCurrency(money.payout)}</span>
+                    <span class="kpi-delta"
+                        >{money.payoutRatio === null
+                            ? "—"
+                            : formatPercent(money.payoutRatio * 100)} от выручки</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Отдано скидками</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(money.discountValue)}</span
+                    >
+                    <span class="kpi-delta">относительно старой цены</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Продано штук</span>
+                    <span class="kpi-value">{formatNumber(money.units)}</span>
+                </div>
+                {#if money.complete}
+                    <div class="kpi-chip glass-panel">
+                        <span class="kpi-label">Финансовые данные</span>
+                        <span class="kpi-value">{money.reportedLines}</span>
+                        <span class="kpi-delta">по всем строкам заказов</span>
+                    </div>
+                {:else}
+                    <div class="kpi-chip glass-panel alert">
+                        <span class="kpi-label">Финансовые данные</span>
+                        <span class="kpi-value"
+                            >{money.reportedLines} из {money.totalLines}</span
+                        >
+                        <span class="kpi-delta"
+                            >Ozon отдал суммы не по всем строкам — доли считаются
+                            только по ним</span
+                        >
+                    </div>
+                {/if}
+            {/if}
+        </div>
+    </section>
+
+    <section class="insights-section">
+        <div class="bento-header">
             <h2 class="section-title">Ключевые показатели · текущий месяц</h2>
             <InfoTip
                 text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Два последних чипа — скользящие окна 24 часа и 7 дней (не календарные) и тоже без отмен, чтобы сравнивать с главным числом дашборда."
@@ -677,7 +783,7 @@
                     </div>
                 {/each}
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Чистая выручка · 24ч</span>
+                    <span class="kpi-label">Выручка продавца · 24ч</span>
                     <span class="kpi-value"
                         >{formatCurrency(deltas.last24h.netRevenue)}</span
                     >
@@ -690,7 +796,7 @@
                     >
                 </div>
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Чистая выручка · 7 дней</span>
+                    <span class="kpi-label">Выручка продавца · 7 дней</span>
                     <span class="kpi-value"
                         >{formatCurrency(deltas.last7d.netRevenue)}</span
                     >
@@ -708,9 +814,9 @@
         <div class="panel glass-panel trend-panel">
             <div class="panel-head">
                 <span class="panel-title-group">
-                    <h3 class="panel-title">Тренд чистой выручки · {windowDays} дн.</h3>
+                    <h3 class="panel-title">Тренд выручки продавца · {windowDays} дн.</h3>
                     <InfoTip
-                        text="Чистая выручка по дням за выбранное окно (без отменённых заказов). Окно 7/14/31 дня задаётся переключателем справа и общее для тренда и графика по часам."
+                        text="Цена продавца по дням за выбранное окно (без отменённых заказов) — это деньги покупателя, а не поступление на счёт. Окно 7/14/31 дня задаётся переключателем справа и общее для тренда и графика по часам."
                         label="Пояснение к тренду выручки"
                     />
                 </span>
@@ -1140,7 +1246,7 @@
                             <th>Date</th>
                             <th style="width: 60px;">Image</th>
                             <th>Product</th>
-                            <th>Total Price</th>
+                            <th>Цена → продавцу</th>
                             <th>Status</th>
                             <th>Payment</th>
                             <th>Route</th>
@@ -1158,6 +1264,9 @@
                             {/each}
                         {:else if paginatedPostings.length > 0}
                             {#each paginatedPostings as posting (posting.posting_number)}
+                                {@const rowMoney = rowMoneyByPosting.get(
+                                    posting.posting_number,
+                                )}
                                 {#each posting.products as product, i (`${product.sku || product.name}-${i}`)}
                                     <tr>
                                         {#if i === 0}
@@ -1234,12 +1343,38 @@
                                                 SKU: {product.sku}
                                             </div>
                                         </td>
-                                        <td class="price-cell"
-                                            >{formatCurrency(
-                                                productUnitPrice(product) *
-                                                    product.quantity,
-                                            )}</td
-                                        >
+                                        <td class="price-cell">
+                                            {#if rowMoney?.[i]?.payout != null}
+                                                <span class="money-gross"
+                                                    >{formatCurrency(rowMoney[i].gross)}</span
+                                                >
+                                                <span class="money-arrow" aria-hidden="true"
+                                                    >→</span
+                                                >
+                                                <span class="money-net"
+                                                    >{formatCurrency(
+                                                        rowMoney[i].payout ?? 0,
+                                                    )}</span
+                                                >
+                                                <div class="id-label">
+                                                    комиссия
+                                                    {formatCurrency(
+                                                        rowMoney[i].commission ?? 0,
+                                                    )}{rowMoney[i].commissionPercent !=
+                                                    null
+                                                        ? ` · ${formatPercent(rowMoney[i].commissionPercent ?? 0)}`
+                                                        : ""}
+                                                </div>
+                                            {:else}
+                                                {formatCurrency(
+                                                    productUnitPrice(product) *
+                                                        (product.quantity || 1),
+                                                )}
+                                                <div class="id-label">
+                                                    Ozon не отдал суммы по этой строке
+                                                </div>
+                                            {/if}
+                                        </td>
                                         {#if i === 0}
                                             <td
                                                 rowspan={posting.products
@@ -1464,6 +1599,24 @@
     .price-cell {
         font-weight: 500;
         color: var(--text-primary);
+        white-space: nowrap;
+    }
+
+    /* Buyer money on the left, seller money on the right — never presented as one
+       number, because the difference is what the business actually earns. */
+    .money-gross {
+        color: var(--text-muted);
+        font-weight: 400;
+    }
+
+    .money-arrow {
+        margin: 0 6px;
+        color: var(--text-disabled);
+    }
+
+    .money-net {
+        color: var(--success);
+        font-weight: 600;
     }
 
     .route-info {

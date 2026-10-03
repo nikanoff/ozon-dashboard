@@ -14,7 +14,7 @@ import type {
 
 /** Remaining fields of a posting that never reach the browser. */
 export function toDashboardPosting(posting: OzonPosting): DashboardPosting {
-    const products = posting.financial_data?.products ?? [];
+    const financialProducts = posting.financial_data?.products ?? [];
 
     return {
         posting_number: posting.posting_number,
@@ -40,8 +40,22 @@ export function toDashboardPosting(posting: OzonPosting): DashboardPosting {
                   cluster_to: posting.financial_data.cluster_to
               }
             : undefined,
+        // Kept whole: payout and commission are the seller's actual money, and they
+        // are the only such figures the free tier exposes.
+        financial_products: financialProducts.map((row) => ({
+            product_id: row.product_id,
+            payout: row.payout,
+            commission_amount: row.commission_amount,
+            commission_percent: row.commission_percent,
+            price: row.price,
+            old_price: row.old_price,
+            total_discount_value: row.total_discount_value,
+            total_discount_percent: row.total_discount_percent,
+            currency_code: row.currency_code,
+            actions: row.actions
+        })),
         actions: [
-            ...new Set(products.flatMap((product) => product.actions ?? []))
+            ...new Set(financialProducts.flatMap((product) => product.actions ?? []))
         ]
     };
 }
