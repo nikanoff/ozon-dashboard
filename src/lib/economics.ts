@@ -4,6 +4,7 @@ import type {
     OzonPostingProduct
 } from './ozon_types';
 import { productUnitPrice } from './stats';
+import { costAt, type CostBook } from './costs';
 
 /**
  * Money, as opposed to revenue.
@@ -18,8 +19,13 @@ import { productUnitPrice } from './stats';
  * conflating them is how a dashboard ends up lying quietly.
  */
 
-/** Cost of one unit, keyed by the seller's own article where possible. */
-export type CostLookup = (offerId: string, sku: number) => number | undefined;
+/**
+ * Cost of one unit, as it applied on a given date.
+ *
+ * Dated on purpose: a margin for August has to use August's purchase price, so the
+ * lookup receives the moment the line was ordered rather than "now".
+ */
+export type CostLookup = (offerId: string, sku: number, at: Date) => number | undefined;
 
 /** A posting line joined with its financial row. */
 export interface EnrichedLine {
@@ -171,15 +177,24 @@ export interface SkuEconomics {
     /** Buyer money. */
     gross: number;
     commission: number;
-    /** Seller money. */
+    /** Seller money, over the units Ozon reported. */
     payout: number;
-    /** Cost of the units sold, when a unit cost is known. */
+    /** Cost of the units whose cost is known; `null` when none is. */
     cogs: number | null;
-    /** Payout minus cost of goods sold. */
+    /**
+     * Payout minus cost of goods sold.
+     *
+     * `null` unless *every* unit has both a reported payout and a known cost —
+     * a partial figure would look like a real loss when it is only missing data.
+     */
     grossProfit: number | null;
-    /** `grossProfit / payout`; `null` without a cost. */
+    /** `grossProfit / payout`; `null` without a complete cost. */
     marginPercent: number | null;
     payoutRatio: number | null;
+    /** Share of units with a known cost, 0..1. */
+    costCoverage: number;
+    /** Share of units with a reported payout, 0..1. */
+    payoutCoverage: number;
     /** Reported lines behind this row, and lines overall. */
     reportedLines: number;
     totalLines: number;
@@ -188,6 +203,16 @@ export interface SkuEconomics {
 /** Stable key for a product across postings and stock rows. */
 export function costKey(offerId: string | undefined, sku: number): string {
     return offerId && offerId.trim() ? offerId.trim() : String(sku);
+}
+
+/**
+ * Adapts a stored cost book into the lookup the aggregations expect.
+ *
+ * Kept here rather than in the store so the dated resolution stays testable without
+ * touching `localStorage`.
+ */
+export function costBookLookup(book: CostBook): CostLookup {
+    return (offerId, sku, at) => costAt(book, costKey(offerId, sku), at)?.unitCost;
 }
 
 /**
@@ -200,9 +225,17 @@ export function skuEconomics(
     postings: DashboardPosting[],
     costs: CostLookup
 ): SkuEconomics[] {
-    const rows = new Map<string, SkuEconomics>();
+    interface Accruing extends SkuEconomics {
+        costedUnits: number;
+        reportedUnits: number;
+        knownCogs: number;
+    }
+
+    const rows = new Map<string, Accruing>();
 
     for (const posting of postings) {
+        const at = new Date(posting.created_at);
+
         for (const line of enrichLines(posting)) {
             const key = costKey(line.offerId, line.sku);
             const row =
@@ -220,50 +253,70 @@ export function skuEconomics(
                     grossProfit: null,
                     marginPercent: null,
                     payoutRatio: null,
+                    costCoverage: 0,
+                    payoutCoverage: 0,
                     reportedLines: 0,
-                    totalLines: 0
-                } satisfies SkuEconomics);
+                    totalLines: 0,
+                    costedUnits: 0,
+                    reportedUnits: 0,
+                    knownCogs: 0
+                } satisfies Accruing);
 
             row.units += line.quantity;
             row.gross += line.gross;
             row.totalLines += 1;
             if (line.name && row.name === row.offerId) row.name = line.name;
 
+            const unitCost = costs(line.offerId, line.sku, at);
+            if (typeof unitCost === 'number' && Number.isFinite(unitCost)) {
+                row.costedUnits += line.quantity;
+                row.knownCogs += unitCost * line.quantity;
+            }
+
             if (line.payout !== null) {
                 row.payout += line.payout;
                 row.commission += line.commission ?? 0;
                 row.reportedLines += 1;
+                row.reportedUnits += line.quantity;
             }
 
             rows.set(key, row);
         }
     }
 
-    const unitCosts = new Map<string, number | undefined>();
-
     return [...rows.values()]
         .map((row) => {
-            if (!unitCosts.has(row.key)) {
-                unitCosts.set(row.key, costs(row.offerId, row.sku));
-            }
-            const unitCost = unitCosts.get(row.key);
+            const costCoverage = row.units > 0 ? row.costedUnits / row.units : 0;
+            const payoutCoverage = row.units > 0 ? row.reportedUnits / row.units : 0;
+            const cogs = row.costedUnits > 0 ? row.knownCogs : null;
 
-            const cogs =
-                typeof unitCost === 'number' && Number.isFinite(unitCost)
-                    ? unitCost * row.units
-                    : null;
-            const grossProfit = cogs === null ? null : row.payout - cogs;
+            // Both halves have to be complete before a profit figure means anything.
+            const complete = costCoverage === 1 && payoutCoverage === 1 && row.units > 0;
+            const grossProfit = complete && cogs !== null ? row.payout - cogs : null;
 
-            return {
-                ...row,
+            const result: SkuEconomics = {
+                key: row.key,
+                sku: row.sku,
+                offerId: row.offerId,
+                name: row.name,
+                units: row.units,
+                gross: row.gross,
+                commission: row.commission,
+                payout: row.payout,
                 cogs,
                 grossProfit,
                 marginPercent:
                     grossProfit === null || row.payout <= 0
                         ? null
                         : (grossProfit / row.payout) * 100,
-                payoutRatio: row.gross > 0 ? row.payout / row.gross : null
+                payoutRatio: row.gross > 0 ? row.payout / row.gross : null,
+                costCoverage,
+                payoutCoverage,
+                reportedLines: row.reportedLines,
+                totalLines: row.totalLines
             };
+
+            return result;
         })
         .sort((a, b) => b.payout - a.payout || b.gross - a.gross);
 }

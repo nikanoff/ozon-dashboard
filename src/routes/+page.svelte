@@ -31,7 +31,16 @@
         topProducts,
     } from "$lib/metrics";
     import { inventoryInsights } from "$lib/inventory";
-    import { moneySummary, enrichLines } from "$lib/economics";
+    import { moneySummary, enrichLines, costBookLookup, skuEconomics, abcAnalysis, breakEvenPrice, lossMaking } from "$lib/economics";
+    import { costBook } from "$lib/stores/cogs";
+    import CogsPanel from "$lib/components/CogsPanel.svelte";
+    import {
+        formatCurrency,
+        formatCurrencyParts,
+        formatDelta,
+        formatNumber,
+        formatPercent,
+    } from "$lib/format";
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import OzonHeader from "$lib/components/OzonHeader.svelte";
     import InfoTip from "$lib/components/InfoTip.svelte";
@@ -122,31 +131,6 @@
     // Clean up resources when component is destroyed
     onDestroy(dispose);
     onDestroy(disposeStocks);
-
-    const currencyFormatter = new Intl.NumberFormat("ru-RU", {
-        style: "currency",
-        currency: "RUB",
-        maximumFractionDigits: 0,
-    });
-
-    function formatCurrency(value: number) {
-        return currencyFormatter.format(value);
-    }
-
-    const numberFormatter = new Intl.NumberFormat("ru-RU");
-    function formatNumber(value: number) {
-        return numberFormatter.format(value);
-    }
-
-    function formatPercent(value: number) {
-        return `${value.toFixed(1)}%`;
-    }
-
-    /** Signed change, or a dash when there is nothing to compare against. */
-    function formatDelta(value: number | null) {
-        if (value === null) return "—";
-        return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
-    }
 
     const isUp = (value: number | null) => value !== null && value >= 0;
     const isDown = (value: number | null) => value !== null && value < 0;
@@ -265,10 +249,81 @@
     });
     const money = $derived(moneySummary(moneyWindow));
 
+    // --- Margin, which needs a cost price the API cannot supply ---
+    //
+    // Costs are resolved per order date, so a margin for an old period uses the price
+    // that applied then instead of today's.
+    const costs = $derived(costBookLookup($costBook));
+    const skuRows = $derived(skuEconomics(moneyWindow, costs));
+
+    const marginTotals = $derived.by(() => {
+        // Only rows where every unit has both a payout and a cost carry a profit figure.
+        const complete = skuRows.filter((row) => row.grossProfit !== null);
+        const payout = complete.reduce((sum, row) => sum + row.payout, 0);
+        const profit = complete.reduce((sum, row) => sum + (row.grossProfit ?? 0), 0);
+
+        return {
+            payout,
+            profit,
+            marginPercent: payout > 0 ? (profit / payout) * 100 : null,
+            covered: complete.length,
+            total: skuRows.length,
+            /** Units whose cost is known, against all units sold. */
+            costedUnits: skuRows.reduce(
+                (sum, row) => sum + row.units * row.costCoverage,
+                0,
+            ),
+            units: skuRows.reduce((sum, row) => sum + row.units, 0),
+            /** An empty book means margin is not merely incomplete, it is unavailable. */
+            hasAnyCost: skuRows.some((row) => row.costCoverage > 0)
+        };
+    });
+
+    // ABC by profit once costs are known, by what the seller keeps before that: ranking
+    // a catalogue by revenue is what made thin-margin bestsellers look like leaders.
+    const abcUsesProfit = $derived(marginTotals.covered > 0);
+    const abc = $derived(
+        abcAnalysis(
+            skuRows.map((row) => ({
+                key: row.key,
+                label: row.name,
+                value: abcUsesProfit ? (row.grossProfit ?? 0) : row.payout
+            })),
+        ),
+    );
+    const abcCounts = $derived({
+        A: abc.filter((row) => row.grade === "A").length,
+        B: abc.filter((row) => row.grade === "B").length,
+        C: abc.filter((row) => row.grade === "C").length
+    });
+
+    const losers = $derived(
+        lossMaking(skuRows).map((row) => ({
+            ...row,
+            unitCost: row.units > 0 && row.cogs !== null ? row.cogs / row.units : null,
+            breakEven: breakEvenPrice(
+                row.units > 0 && row.cogs !== null ? row.cogs / row.units : null,
+                row.payoutRatio
+            )
+        })),
+    );
+
+    let showCogs = $state(false);
+
+    // Products offered in the cost panel: everything that sold in the window.
+    const costCandidates = $derived(
+        skuRows.map((row) => ({
+            key: row.key,
+            label: row.name,
+            units: row.units,
+            payout: row.payout
+        })),
+    );
+
     // Dynamic title for the browser tab, showing today's net sales once there are any.
     const pageTitle = $derived(
         stats.calendarDay.netSum > 0
-            ? `${formatCurrency(stats.calendarDay.netSum).replace("₽", "").trim()} ₽ сегодня | Ozon Dashboard`
+            ? `${formatCurrency(stats.calendarDay.netSum)} сегодня | Ozon Dashboard`
             : "Ozon Seller Dashboard | Аналитика продаж",
     );
 
@@ -483,9 +538,7 @@
                     <div class="card-main-value">
                         <span class="currency-symbol">₽</span>
                         <span class="diamond-text text-xl"
-                            >{formatCurrency(stats.calendarDay.netSum)
-                                .replace("₽", "")
-                                .trim()}</span
+                            >{formatCurrencyParts(stats.calendarDay.netSum).amount}</span
                         >
                         <!-- This is the seller's price, i.e. what the buyer pays. It is
                              not what reaches the account; the money block below says
@@ -530,9 +583,7 @@
                     <div class="card-value-group">
                         <!-- Main: Net Sales -->
                         <span class="diamond-text text-lg"
-                            >{formatCurrency(stats.calendarWeek.netSum)
-                                .replace("₽", "")
-                                .trim()}</span
+                            >{formatCurrencyParts(stats.calendarWeek.netSum).amount}</span
                         >
                         <span class="unit">₽</span>
                     </div>
@@ -571,9 +622,7 @@
                     <span class="bento-label">Calendar Month</span>
                     <div class="card-value-group">
                         <span class="diamond-text text-lg"
-                            >{formatCurrency(stats.calendarMonth.netSum)
-                                .replace("₽", "")
-                                .trim()}</span
+                            >{formatCurrencyParts(stats.calendarMonth.netSum).amount}</span
                         >
                         <span class="unit">₽</span>
                     </div>
@@ -611,9 +660,7 @@
                 <span class="bento-label small">Last 24 Hours</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
-                        >{formatCurrency(stats.last24h.netSum)
-                            .replace("₽", "")
-                            .trim()}</span
+                        >{formatCurrencyParts(stats.last24h.netSum).amount}</span
                     >
                 </div>
                 <div class="micro-stat-group">
@@ -636,9 +683,7 @@
                 <span class="bento-label small">Last 7 Days</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
-                        >{formatCurrency(stats.last7d.netSum)
-                            .replace("₽", "")
-                            .trim()}</span
+                        >{formatCurrencyParts(stats.last7d.netSum).amount}</span
                     >
                 </div>
                 <div class="micro-stat-group">
@@ -661,9 +706,7 @@
                 <span class="bento-label small">Last 31 Days</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
-                        >{formatCurrency(stats.last31d.netSum)
-                            .replace("₽", "")
-                            .trim()}</span
+                        >{formatCurrencyParts(stats.last31d.netSum).amount}</span
                     >
                 </div>
                 <div class="micro-stat-group">
@@ -757,6 +800,164 @@
                 {/if}
             {/if}
         </div>
+    </section>
+
+    <section class="insights-section">
+        <div class="bento-header">
+            <h2 class="section-title">Маржа и ассортимент · последние 31 день</h2>
+            <InfoTip
+                text="Маржа считается как «остаётся продавцу» минус себестоимость проданных штук. Себестоимость Ozon не знает и не отдаёт — её задаёт продавец, и она хранится в этом браузере. Пока себестоимость известна не по всем штукам, прибыль по товару не показывается: подставить ноль значило бы выдать отсутствие данных за убыток. ABC-разбор идёт по прибыли, когда она известна, и по остатку продавцу, пока нет."
+                label="Пояснение к марже"
+            />
+            <button
+                type="button"
+                class="btn-inline"
+                onclick={() => (showCogs = true)}
+            >
+                Себестоимость ({marginTotals.covered}/{marginTotals.total})
+            </button>
+        </div>
+
+        <div class="kpi-strip">
+            {#if showSkeletons}
+                {#each [1, 2, 3, 4] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            {:else if !marginTotals.hasAnyCost}
+                <div class="panel glass-panel state-note">
+                    <p>
+                        Себестоимость не задана, поэтому прибыль и маржа не считаются.
+                        Выручка, комиссия и остаток продавцу выше — настоящие, они
+                        приходят из Ozon.
+                    </p>
+                    <button
+                        type="button"
+                        class="btn-inline"
+                        onclick={() => (showCogs = true)}
+                    >
+                        Задать себестоимость
+                    </button>
+                </div>
+            {:else}
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Валовая прибыль</span>
+                    <span class="kpi-value">{formatCurrency(marginTotals.profit)}</span>
+                    <span class="kpi-delta"
+                        >по {marginTotals.covered} из {marginTotals.total} SKU</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Маржа</span>
+                    <span class="kpi-value"
+                        >{marginTotals.marginPercent === null
+                            ? "—"
+                            : formatPercent(marginTotals.marginPercent)}</span
+                    >
+                    <span class="kpi-delta">от остатка продавцу</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Себестоимость продаж</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(
+                            marginTotals.payout - marginTotals.profit,
+                        )}</span
+                    >
+                    <span class="kpi-delta">по покрытым SKU</span>
+                </div>
+                <div class="kpi-chip glass-panel" class:alert={losers.length > 0}>
+                    <span class="kpi-label">Продаются в минус</span>
+                    <span class="kpi-value">{losers.length}</span>
+                    <span class="kpi-delta"
+                        >{marginTotals.costedUnits < marginTotals.units
+                            ? `себестоимость известна для ${Math.round(marginTotals.costedUnits)} из ${marginTotals.units} шт`
+                            : "по всем проданным штукам"}</span
+                    >
+                </div>
+            {/if}
+        </div>
+
+        {#if !showSkeletons && marginTotals.hasAnyCost}
+            <div class="panel glass-panel">
+                <div class="panel-head">
+                    <span class="panel-title-group">
+                        <h3 class="panel-title">
+                            ABC по {abcUsesProfit ? "прибыли" : "остатку продавцу"}
+                        </h3>
+                        <InfoTip
+                            text="Класс A — товары, дающие первые 80% результата, B — следующие 15%, C — остаток. Когда себестоимость известна, результат — это прибыль; иначе это остаток продавцу после комиссии."
+                            label="Пояснение к ABC"
+                        />
+                    </span>
+                    <div class="panel-controls">
+                        <span class="panel-note"
+                            >A {abcCounts.A} · B {abcCounts.B} · C {abcCounts.C}</span
+                        >
+                    </div>
+                </div>
+                {#if abc.length === 0}
+                    <p class="muted-note">Нет данных за период.</p>
+                {:else}
+                    <div class="mini-list">
+                        {#each abc.slice(0, 8) as row (row.key)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={row.label}>
+                                    <span class="abc-badge" data-grade={row.grade}
+                                        >{row.grade}</span
+                                    >
+                                    {row.label}
+                                </span>
+                                <span class="mini-value"
+                                    >{formatCurrency(row.value)} · {formatPercent(
+                                        row.share,
+                                    )}</span
+                                >
+                            </div>
+                            <div
+                                class="mini-bar"
+                                style="width: {Math.max(2, Math.round(row.share))}%"
+                            ></div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+        {/if}
+
+        {#if !showSkeletons && losers.length > 0}
+            <div class="panel glass-panel loss-panel">
+                <div class="panel-head">
+                    <span class="panel-title-group">
+                        <h3 class="panel-title">Продаются ниже себестоимости</h3>
+                        <InfoTip
+                            text="Эти товары приносят меньше, чем стоит их закупка. «Безубыточная цена» — цена, при которой товар перестанет терять деньги при текущей доле, остающейся продавцу."
+                            label="Пояснение к убыточным товарам"
+                        />
+                    </span>
+                </div>
+                <div class="loss-list">
+                    {#each losers as row (row.key)}
+                        <div class="loss-row">
+                            <span class="loss-name" title={row.name}>{row.name}</span>
+                            <span class="loss-money">
+                                <span class="loss-value"
+                                    >{formatCurrency(row.grossProfit ?? 0)}</span
+                                >
+                                <span class="loss-detail">
+                                    {row.units} шт · закупка
+                                    {formatCurrency(row.unitCost ?? 0)}/шт
+                                    {#if row.breakEven !== null}
+                                        · безубыток от
+                                        {formatCurrency(row.breakEven)}
+                                    {/if}
+                                </span>
+                            </span>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        {/if}
     </section>
 
     <section class="insights-section">
@@ -1463,6 +1664,10 @@
             </div>
         </div>
     </section>
+    {/if}
+
+    {#if showCogs}
+        <CogsPanel products={costCandidates} onClose={() => (showCogs = false)} />
     {/if}
 </div>
 
@@ -2737,5 +2942,96 @@
     .no-data p,
     .state-note p {
         margin: 0;
+    }
+
+    /* --- Margin and assortment --- */
+
+    .btn-inline {
+        margin-left: auto;
+        background: transparent;
+        border: 1px solid var(--border-hover);
+        color: var(--text-primary);
+        padding: 0.4rem 0.9rem;
+        min-height: 36px;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 0.72rem;
+        font-weight: 600;
+        white-space: nowrap;
+    }
+
+    .btn-inline:hover {
+        background: rgba(255, 255, 255, 0.06);
+    }
+
+    /* Class letters carry the meaning, so they are visible rather than colour-only. */
+    .abc-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        margin-right: 6px;
+        border-radius: 4px;
+        font-size: 0.65rem;
+        font-weight: 700;
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text-primary);
+    }
+
+    .abc-badge[data-grade="A"] {
+        background: rgba(16, 185, 129, 0.18);
+        color: #34d399;
+    }
+
+    .abc-badge[data-grade="B"] {
+        background: rgba(234, 179, 8, 0.16);
+        color: var(--accent-gold);
+    }
+
+    .loss-panel {
+        margin-top: var(--space-lg);
+        border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .loss-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .loss-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: var(--space-md);
+    }
+
+    .loss-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: var(--text-sm);
+        color: var(--text-primary);
+    }
+
+    .loss-money {
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .loss-value {
+        display: block;
+        color: var(--error);
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .loss-detail {
+        display: block;
+        font-size: 0.7rem;
+        color: var(--text-muted);
     }
 </style>

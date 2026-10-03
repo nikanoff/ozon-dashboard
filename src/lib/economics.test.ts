@@ -164,6 +164,8 @@ describe('skuEconomics', () => {
         expect(rows[0].cogs).toBeNull();
         expect(rows[0].grossProfit).toBeNull();
         expect(rows[0].marginPercent).toBeNull();
+        expect(rows[0].costCoverage).toBe(0);
+        expect(rows[0].payoutCoverage).toBe(1);
     });
 
     it('computes margin against payout, not against revenue', () => {
@@ -173,6 +175,55 @@ describe('skuEconomics', () => {
         expect(rows[0].cogs).toBe(200);
         expect(rows[0].grossProfit).toBe(500);
         expect(rows[0].marginPercent).toBeCloseTo((500 / 700) * 100);
+        expect(rows[0].costCoverage).toBe(1);
+    });
+
+    it('refuses a profit figure while the cost covers only part of the units', () => {
+        // Two postings of one unit each; only the first has a cost.
+        const rows = skuEconomics(
+            [
+                posting({ payout: 700 }, { posting_number: 'a', created_at: '2026-09-10T00:00:00Z' }),
+                posting({ payout: 700 }, { posting_number: 'b', created_at: '2026-09-11T00:00:00Z' })
+            ],
+            (_offerId, _sku, at) => (at.getUTCDate() === 10 ? 100 : undefined)
+        );
+
+        expect(rows[0].units).toBe(4);
+        expect(rows[0].costCoverage).toBeCloseTo(0.5);
+        // A partial cost would have shown a fake 2400 profit, so it stays unknown.
+        expect(rows[0].grossProfit).toBeNull();
+        expect(rows[0].cogs).toBe(200);
+    });
+
+    it('refuses a profit figure while Ozon reported only part of the payout', () => {
+        const rows = skuEconomics(
+            [
+                posting({ payout: 700 }, { posting_number: 'a' }),
+                posting(undefined, { posting_number: 'b' })
+            ],
+            () => 100
+        );
+
+        expect(rows[0].payoutCoverage).toBeCloseTo(0.5);
+        expect(rows[0].grossProfit).toBeNull();
+    });
+
+    it('resolves the cost as of the order date, not as of today', () => {
+        // Cost was 100 in August and 300 in September.
+        const costs = (_offerId: string, _sku: number, at: Date) =>
+            at.getUTCMonth() === 8 ? 300 : 100;
+
+        const rows = skuEconomics(
+            [
+                posting({ payout: 700 }, { posting_number: 'aug', created_at: '2026-08-20T00:00:00Z' }),
+                posting({ payout: 700 }, { posting_number: 'sep', created_at: '2026-09-20T00:00:00Z' })
+            ],
+            costs
+        );
+
+        // 2 units at 100 plus 2 units at 300.
+        expect(rows[0].cogs).toBe(800);
+        expect(rows[0].grossProfit).toBe(600);
     });
 
     it('falls back to the SKU when the article is empty', () => {
@@ -237,9 +288,8 @@ describe('breakEvenPrice', () => {
 
 describe('lossMaking', () => {
     it('selects only rows with a known negative profit', () => {
-        const rows = skuEconomics([posting({ payout: 700 })], (offerId) =>
-            offerId === 'ART-1' ? 500 : undefined
-        );
+        const rows = skuEconomics([posting({ payout: 700 })], () => 500);
+        // 2 units at 500 = 1000 against a payout of 700.
         expect(lossMaking(rows)).toHaveLength(1);
 
         const unknown = skuEconomics([posting({ payout: 700 })], () => undefined);
