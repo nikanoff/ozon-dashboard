@@ -6,7 +6,15 @@
 //   - /api/* and any request with a query string (SvelteKit data fetches) are left
 //     to the network so cached data never goes stale.
 
-const VERSION = "v1";
+/**
+ * Bumped by hand whenever a release should reach installed clients at once.
+ *
+ * The static strategy is stale-while-revalidate, so a cached file is served first and
+ * refreshed behind the reader — one load behind, which is invisible for a hashed bundle and
+ * confusing for everything else. Raising this makes `activate` drop the old caches, so the
+ * next fetch goes to the network.
+ */
+const VERSION = "v2";
 const STATIC_CACHE = `ozon-static-${VERSION}`;
 const PAGE_CACHE = `ozon-pages-${VERSION}`;
 
