@@ -43,6 +43,8 @@
     } from "$lib/metrics";
     import { inventoryInsights } from "$lib/inventory";
     import { moneySummary, enrichLines, costBookLookup, skuEconomics, abcAnalysis, breakEvenPrice, lossMaking } from "$lib/economics";
+    import { capitalSummary, suggestedOrder } from "$lib/capital";
+    import { buildActions } from "$lib/actions";
     import { costBook } from "$lib/stores/cogs";
     import CogsPanel from "$lib/components/CogsPanel.svelte";
     import {
@@ -413,6 +415,77 @@
 
     let showCogs = $state(false);
 
+    // --- Capital and priorities ---
+    const capital = $derived(
+        capitalSummary({
+            inventory,
+            economics: skuRows,
+            unitCost: (offerId, sku) => costs(offerId, sku, new Date()),
+            periodDays: MONEY_WINDOW_DAYS
+        })
+    );
+
+    const actions = $derived(
+        buildActions({
+            capital,
+            economics: skuRows,
+            finance,
+            costedShare: capital.costedShare,
+            soldCostCoverage:
+                marginTotals.units > 0 ? marginTotals.costedUnits / marginTotals.units : 0,
+            now: new Date()
+        })
+    );
+
+    const ACTION_SEVERITY_LABELS: Record<string, string> = {
+        high: "Срочно",
+        medium: "Важно",
+        low: "К сведению"
+    };
+
+    const ACTION_BASIS_LABELS: Record<string, string> = {
+        day: "в день",
+        period: "за период",
+        once: "заморожено",
+        none: ""
+    };
+
+    /** Restocking suggestion for the items running out, most urgent first. */
+    const RESTOCK_COVER_DAYS = 30;
+    const replenishment = $derived(
+        capital.rows
+            .filter(
+                (row) =>
+                    row.demandPerDay > 0 &&
+                    (row.health === "out" ||
+                        row.health === "critical" ||
+                        row.health === "low"),
+            )
+            .map((row) => {
+                const unitCost =
+                    row.stockUnits > 0 && row.stockAtCost !== null
+                        ? row.stockAtCost / row.stockUnits
+                        : null;
+                const units = suggestedOrder(
+                    row.demandPerDay,
+                    row.stockUnits,
+                    RESTOCK_COVER_DAYS,
+                );
+
+                return {
+                    key: row.key,
+                    name: row.name,
+                    stockUnits: row.stockUnits,
+                    units,
+                    /** What the order costs, when a cost price is known. */
+                    money: unitCost === null ? null : units * unitCost
+                };
+            })
+            .filter((row) => row.units > 0)
+            .sort((a, b) => (b.money ?? 0) - (a.money ?? 0) || b.units - a.units)
+            .slice(0, 6)
+    );
+
     // Products offered in the cost panel: everything that sold in the window.
     const costCandidates = $derived(
         skuRows.map((row) => ({
@@ -586,6 +659,64 @@
             </p>
         </div>
     {:else}
+    <section class="insights-section" aria-label="Что требует действия">
+        <div class="bento-header">
+            <h2 class="section-title">Требует действия</h2>
+            <InfoTip
+                text="Сводка того, что стоит сделать, с суммой на кону. У каждой строки указана своя база: «в день» — теряется ежедневно, «за период» — уже потеряно за 31 день, «заморожено» — деньги, вложенные в товар и не возвращающиеся продажами. Складывать эти числа между собой нельзя."
+                label="Пояснение к списку действий"
+            />
+        </div>
+
+        {#if showSkeletons}
+            <div class="action-list" aria-hidden="true">
+                {#each [1, 2, 3] as card (card)}
+                    <div class="action-card">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            </div>
+        {:else if actions.length === 0}
+            <div class="panel glass-panel state-note">
+                <p>Срочного нет: дефицита нет, убыточных товаров нет, начисления свежие.</p>
+            </div>
+        {:else}
+            <div class="action-list">
+                {#each actions as action (action.kind)}
+                    <div class="action-card" data-severity={action.severity}>
+                        <div class="action-main">
+                            <span class="action-head">
+                                <span class="action-severity" data-severity={action.severity}
+                                    >{ACTION_SEVERITY_LABELS[action.severity]}</span
+                                >
+                                <span class="action-title">{action.title}</span>
+                            </span>
+                            <span class="action-detail">{action.detail}</span>
+                            {#if action.skus.length > 0}
+                                <span class="action-skus">
+                                    {action.skus.map((item) => item.name).join(" · ")}{action
+                                        .skus.length >= 5
+                                        ? " и другие"
+                                        : ""}
+                                </span>
+                            {/if}
+                        </div>
+                        {#if action.amount !== null}
+                            <div class="action-amount">
+                                <span class="action-value"
+                                    >{formatCurrency(action.amount)}</span
+                                >
+                                <span class="action-basis"
+                                    >{ACTION_BASIS_LABELS[action.basis]}</span
+                                >
+                            </div>
+                        {/if}
+                    </div>
+                {/each}
+            </div>
+        {/if}
+    </section>
     <section class="stats-section" aria-busy={showSkeletons}>
         <div class="bento-header">
             <h2 class="section-title">Performance Analytics</h2>
@@ -1228,6 +1359,167 @@
                     {/each}
                 </div>
             </div>
+        {/if}
+    </section>
+
+    <section class="insights-section">
+        <div class="bento-header">
+            <h2 class="section-title">Капитал и оборачиваемость</h2>
+            <InfoTip
+                text="Сколько денег вложено в товар на складе и как быстро они возвращаются. Запас в закупке — это оборотный капитал по вашей себестоимости, а не по цене продажи. Оборачиваемость и GMROI считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним, — при ровном складе это близко к среднему. Упускается в день: товар продаётся, но его нет на складе, поэтому каждая строка показывает потерю за сутки, а не выдуманный итог за неизвестный срок простоя."
+                label="Пояснение к капиталу"
+            />
+        </div>
+
+        {#if showSkeletons}
+            <div class="kpi-strip" aria-hidden="true">
+                {#each [1, 2, 3, 4] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            </div>
+        {:else}
+            <div class="kpi-strip">
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Запас в закупке</span>
+                    <span class="kpi-value"
+                        >{capital.stockAtCost === null
+                            ? "—"
+                            : formatCurrency(capital.stockAtCost)}</span
+                    >
+                    <span class="kpi-delta"
+                        >в ценах продажи
+                        {formatCurrency(capital.stockAtRetail)}
+                        {capital.costedShare < 1
+                            ? ` · себестоимость известна для ${formatPercent(capital.costedShare * 100, 0)} запаса`
+                            : ""}</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Оборачиваемость</span>
+                    <span class="kpi-value"
+                        >{capital.turnoverRatio === null
+                            ? "—"
+                            : `${capital.turnoverRatio.toFixed(2).replace(".", ",")}×`}</span
+                    >
+                    <span class="kpi-delta"
+                        >{capital.daysOfStock === null
+                            ? "нужна полная себестоимость"
+                            : `запас на ${Math.round(capital.daysOfStock)} дн.`}</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">GMROI</span>
+                    <span class="kpi-value"
+                        >{capital.gmroi === null
+                            ? "—"
+                            : formatPercent(capital.gmroi, 0)}</span
+                    >
+                    <span class="kpi-delta">валовая прибыль на рубль запаса</span>
+                </div>
+                <div class="kpi-chip glass-panel" class:alert={capital.lostRows.length > 0}>
+                    <span class="kpi-label">Упускается в день</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(
+                            capital.lostProfitPerDay ?? capital.lostRevenuePerDay,
+                        )}</span
+                    >
+                    <span class="kpi-delta">
+                        {#if capital.lostRows.length === 0}
+                            нет товаров в дефиците со спросом
+                        {:else if capital.lostProfitPerDay === null}
+                            выручка · {capital.lostRows.length} SKU в дефиците
+                        {:else}
+                            маржа · {capital.lostRows.length} SKU в дефиците
+                        {/if}
+                    </span>
+                </div>
+                <div class="kpi-chip glass-panel" class:alert={capital.frozenSkus > 0}>
+                    <span class="kpi-label">Заморожено в неликвиде</span>
+                    <span class="kpi-value"
+                        >{capital.frozenAtCost === null
+                            ? `${formatNumber(capital.frozenUnits)} шт`
+                            : formatCurrency(capital.frozenAtCost)}</span
+                    >
+                    <span class="kpi-delta"
+                        >{capital.frozenSkus} SKU · {formatNumber(
+                            capital.frozenUnits,
+                        )} шт</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Sell-through</span>
+                    <span class="kpi-value"
+                        >{capital.sellThrough === null
+                            ? "—"
+                            : formatPercent(capital.sellThrough, 0)}</span
+                    >
+                    <span class="kpi-delta">продано от проданного и лежащего</span>
+                </div>
+            </div>
+
+            {#if replenishment.length > 0}
+                <div class="panel glass-panel">
+                    <div class="panel-head">
+                        <span class="panel-title-group">
+                            <h3 class="panel-title">Что заказать · запас на 30 дней</h3>
+                            <InfoTip
+                                text="Количество считается по наблюдённому темпу продаж: сколько нужно, чтобы закрыть 30 дней, минус то, что уже лежит на складе. Это оценка по прошлому спросу, а не гарантия продаж."
+                                label="Пояснение к закупке"
+                            />
+                        </span>
+                    </div>
+                    <div class="mini-list">
+                        {#each replenishment as row (row.key)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={row.name}>{row.name}</span>
+                                <span class="mini-value"
+                                    >{row.stockUnits} шт → заказать {row.units} шт{#if row.money !== null}
+                                        · {formatCurrency(row.money)}{/if}</span
+                                >
+                            </div>
+                        {/each}
+                    </div>
+                </div>
+            {/if}
+
+            {#if capital.lostRows.length > 0}
+                <div class="panel glass-panel loss-panel">
+                    <div class="panel-head">
+                        <span class="panel-title-group">
+                            <h3 class="panel-title">Дефицит со спросом</h3>
+                            <InfoTip
+                                text="Товар продавался, но сейчас его нет на складе. Сумма — потеря за одни сутки при текущем темпе продаж. Сколько именно длится простой, из данных не видно, поэтому итог за период не выдумывается."
+                                label="Пояснение к дефициту"
+                            />
+                        </span>
+                    </div>
+                    <div class="loss-list">
+                        {#each capital.lostRows.slice(0, 10) as row (row.key)}
+                            <div class="loss-row">
+                                <span class="loss-name" title={row.name}>{row.name}</span>
+                                <span class="loss-money">
+                                    <span class="loss-value"
+                                        >{formatCurrency(
+                                            row.dailyLostProfit ?? row.dailyLostRevenue,
+                                        )}/день</span
+                                    >
+                                    <span class="loss-detail">
+                                        {row.demandPerDay.toFixed(1).replace(".", ",")} шт/день
+                                        {#if row.dailyLostProfit === null}
+                                            · упущенная выручка
+                                        {:else}
+                                            · упущенная маржа
+                                        {/if}
+                                    </span>
+                                </span>
+                            </div>
+                        {/each}
+                    </div>
+                </div>
+            {/if}
         {/if}
     </section>
 
@@ -3314,5 +3606,123 @@
         text-transform: uppercase;
         letter-spacing: 0.06em;
         white-space: nowrap;
+    }
+
+    /* --- Action feed --- */
+
+    .action-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .action-card {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-md);
+        padding: var(--space-md);
+        border: 1px solid var(--border-subtle);
+        border-left: 3px solid var(--border-hover);
+        border-radius: var(--radius-sm);
+        background: var(--bg-card);
+    }
+
+    .action-card[data-severity="high"] {
+        border-left-color: var(--error);
+    }
+
+    .action-card[data-severity="medium"] {
+        border-left-color: var(--warning);
+    }
+
+    .action-card[data-severity="low"] {
+        border-left-color: var(--info);
+    }
+
+    .action-main {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .action-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+
+    /* Severity is spelled out, not encoded in colour alone. */
+    .action-severity {
+        font-size: 0.62rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        padding: 2px 6px;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+
+    .action-severity[data-severity="high"] {
+        background: rgba(239, 68, 68, 0.16);
+        color: #f87171;
+    }
+
+    .action-severity[data-severity="medium"] {
+        background: rgba(234, 179, 8, 0.15);
+        color: var(--accent-gold);
+    }
+
+    .action-title {
+        font-size: var(--text-sm);
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .action-detail {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        line-height: 1.45;
+    }
+
+    .action-skus {
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .action-amount {
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .action-value {
+        display: block;
+        font-family: var(--font-heading);
+        font-weight: 700;
+        font-size: 1rem;
+        color: var(--text-primary);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .action-basis {
+        display: block;
+        font-size: 0.65rem;
+        color: var(--text-muted);
+    }
+
+    @media (max-width: 640px) {
+        .action-card {
+            flex-direction: column;
+        }
+
+        .action-amount {
+            text-align: left;
+        }
     }
 </style>
