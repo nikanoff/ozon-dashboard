@@ -25,8 +25,15 @@
     <button
         class="auth-toggle"
         onclick={() => (showSettings = !showSettings)}
-        title="API Configuration"
+        title="Client ID и API Key"
+        aria-label="Client ID и API Key"
+        aria-expanded={showSettings}
     >
+        <!--
+            A key, and the word for it. The previous mark was a circle with a stroke through
+            it — a power symbol to most eyes — over fields that take an account id and a key,
+            so nothing about it said what it opened.
+        -->
         <svg
             viewBox="0 0 24 24"
             width="16"
@@ -34,11 +41,14 @@
             fill="none"
             stroke="currentColor"
             stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
         >
-            <path
-                d="M12 15V17M12 7V13M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z"
-            />
+            <circle cx="8" cy="15" r="4" />
+            <path d="M10.85 12.15 19 4M18 5l2 2M15 8l2 2" />
         </svg>
+        <span class="auth-label">API</span>
     </button>
 
     {#if showSettings}
@@ -81,13 +91,23 @@
         background: transparent;
         border: 1px solid var(--border-subtle);
         color: var(--text-muted);
-        padding: 8px;
+        padding: 8px 10px;
         cursor: pointer;
         border-radius: var(--radius-sm);
         transition: all 0.2s;
         display: flex;
         align-items: center;
         justify-content: center;
+        gap: 6px;
+        font-family: inherit;
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+    }
+
+    /* Reads as a label for the key beside it, not as a second glyph. */
+    .auth-label {
+        line-height: 1;
     }
 
     .auth-toggle:hover {

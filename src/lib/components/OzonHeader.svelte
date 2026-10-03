@@ -258,10 +258,13 @@
             gap: var(--space-sm);
         }
 
+        /*
+            The refresh button goes on a phone. It was stretched across the row there, which
+            made a manual reload look like the main action, and the badge beside it already
+            says whether the data is live. Reopening the app refreshes anyway.
+        */
         .btn-refresh {
-            flex: 1 1 auto;
-            justify-content: center;
-            padding: 0.5rem 1rem;
+            display: none;
         }
 
         .subtitle {
