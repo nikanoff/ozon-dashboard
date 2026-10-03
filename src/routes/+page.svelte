@@ -1,5 +1,16 @@
 <script lang="ts">
-    import { getDashboardData, getStocksData } from "$lib/ozon_api";
+    import { getDashboardData, getStocksData, getEconomicsData } from "$lib/ozon_api";
+    import {
+        cachedWindow,
+        daysToFetch,
+        emptyAccrualCache,
+        mergeAccrualDays,
+        pruneAccrualCache,
+        // Aliased: the page already has a `windowDays` state for the trend toggle.
+        windowDays as accrualWindowDays,
+        type AccrualCache,
+    } from "$lib/accrual_cache";
+    import { summariseFinance, groupTotals, FEE_GROUP_LABELS, typeLabel } from "$lib/pnl";
     import {
         mergeDashboardPayload,
         needsFullLoad,
@@ -117,6 +128,95 @@
         dispose: disposeStocks,
     } = stocksResult;
 
+    // --- The financial layer: accruals, the money that actually arrives ---
+    //
+    // `/v1/finance/accrual/by-day` answers for one day at a time, so the window is
+    // fetched once and kept in localStorage. Closed days never change, so later visits
+    // ask only for the two trailing days instead of walking all 31 again.
+    const FINANCE_WINDOW_DAYS = 31;
+    const accrualWindow = $derived(accrualWindowDays(new Date(), FINANCE_WINDOW_DAYS));
+
+    function accrualStorageKey() {
+        return `ozon_accruals:${clientId}`;
+    }
+
+    function readAccrualCache(): AccrualCache {
+        try {
+            const raw = localStorage.getItem(accrualStorageKey());
+            if (!raw) return emptyAccrualCache();
+
+            const parsed = JSON.parse(raw) as AccrualCache;
+            if (!parsed || typeof parsed !== "object" || typeof parsed.days !== "object") {
+                return emptyAccrualCache();
+            }
+
+            return {
+                days: parsed.days ?? {},
+                types: parsed.types ?? {},
+                fetchedAt: parsed.fetchedAt ?? null
+            };
+        } catch {
+            // A damaged cache must not stop the page from rendering.
+            return emptyAccrualCache();
+        }
+    }
+
+    function writeAccrualCache(cache: AccrualCache) {
+        try {
+            localStorage.setItem(accrualStorageKey(), JSON.stringify(cache));
+        } catch {
+            // Quota is not a reason to lose the data already on screen.
+        }
+    }
+
+    const economicsResult = useSWR(
+        `ozon-economics:${clientId}`,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
+            }
+
+            const cache = readAccrualCache();
+            const window = accrualWindowDays(new Date(), FINANCE_WINDOW_DAYS);
+            const missing = daysToFetch(cache, window);
+            const needsTypes = Object.keys(cache.types).length === 0;
+
+            if (missing.length === 0 && !needsTypes) return cache;
+
+            const payload = await getEconomicsData(signal, missing, needsTypes);
+            const merged = pruneAccrualCache(
+                mergeAccrualDays(cache, payload.days, payload.types, payload.fetchedAt),
+                window,
+            );
+            writeAccrualCache(merged);
+
+            return merged;
+        },
+        // Day-level data: a slow refresh is enough, and every poll costs requests.
+        { dedupingInterval: 2000, refreshInterval: 30 * 60 * 1000 },
+    );
+
+    const {
+        data: financeData,
+        error: financeError,
+        isLoading: financeLoading,
+        isValidating: financeValidating,
+        mutate: mutateFinance,
+        reset: resetFinance,
+        dispose: disposeFinance,
+    } = economicsResult;
+
+    const accrualDays = $derived(
+        $financeData ? cachedWindow($financeData, accrualWindow) : [],
+    );
+    const finance = $derived(
+        summariseFinance(accrualDays, $financeData?.types ?? {}),
+    );
+    const financeGroups = $derived(groupTotals(finance.orderLines));
+    const financeLoadError = $derived($financeError?.message ?? null);
+
     // Reload when the credentials change; useSWR already loads the initial value.
     // Both requests are reset first, so the previous account's payload is dropped
     // before the new one is fetched — otherwise it would stay on screen and get
@@ -124,13 +224,16 @@
     refreshOnKeysChange(() => {
         resetDashboard();
         resetStocks();
+        resetFinance();
         mutate({ force: true });
         mutateStocks({ force: true });
+        mutateFinance({ force: true });
     });
 
     // Clean up resources when component is destroyed
     onDestroy(dispose);
     onDestroy(disposeStocks);
+    onDestroy(disposeFinance);
 
     const isUp = (value: number | null) => value !== null && value >= 0;
     const isDown = (value: number | null) => value !== null && value < 0;
@@ -800,6 +903,174 @@
                 {/if}
             {/if}
         </div>
+    </section>
+
+    <section class="insights-section">
+        <div class="bento-header">
+            <h2 class="section-title">Начисления Ozon · последние 31 день</h2>
+            <InfoTip
+                text="Это то, что Ozon начислил и удержал по каждому отправлению — единственный источник, по которому видно, сколько денег реально дойдёт до счёта. Сумма берётся из total_amount как есть и никогда не пересчитывается из комиссии и услуг: у штрафов, страховки и компенсаций отдельных строк нет. Расходы кабинета (хранение, продвижение, сбор отзывов) показаны отдельно и не размазаны по заказам — иначе цифра по отправлению перестала бы сходиться с кабинетом."
+                label="Пояснение к начислениям"
+            />
+            {#if !$financeLoading && finance.failedDays.length === 0 && finance.lastDayWithData}
+                <span class="freshness" role="status" aria-live="polite">
+                    данные по {finance.lastDayWithData}
+                </span>
+            {/if}
+        </div>
+
+        {#if $financeLoading}
+            <div class="kpi-strip" aria-hidden="true">
+                {#each [1, 2, 3, 4] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            </div>
+            <p class="muted-note">
+                Финансовый слой читается по одному дню за запрос, поэтому первый раз это
+                занимает несколько секунд. Дальше закрытые дни берутся из кэша браузера.
+            </p>
+        {:else if financeLoadError}
+            <div class="panel glass-panel state-note" role="alert">
+                <p>Начисления не загрузились: {financeLoadError}</p>
+                <button
+                    type="button"
+                    class="btn-inline"
+                    onclick={() => mutateFinance({ force: true })}
+                    disabled={$financeValidating}
+                >
+                    {$financeValidating ? "Обновляем…" : "Повторить"}
+                </button>
+            </div>
+        {:else}
+            <div class="kpi-strip">
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">К получению по заказам</span>
+                    <span class="kpi-value">{formatCurrency(finance.netOrders)}</span>
+                    <span class="kpi-delta">{finance.accrualCount} начислений</span>
+                </div>
+                <div class="kpi-chip glass-panel" class:alert={finance.netCabinet < 0}>
+                    <span class="kpi-label">Расходы кабинета</span>
+                    <span class="kpi-value">{formatCurrency(finance.netCabinet)}</span>
+                    <span class="kpi-delta">хранение, продвижение, прочее</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Итого за период</span>
+                    <span class="kpi-value">{formatCurrency(finance.net)}</span>
+                    <span class="kpi-delta">то, что дойдёт до счёта</span>
+                </div>
+                <div class="kpi-chip glass-panel" class:alert={finance.failedDays.length > 0}>
+                    <span class="kpi-label">Дней с данными</span>
+                    <span class="kpi-value">{finance.daysWithData}</span>
+                    <span class="kpi-delta">
+                        {#if finance.failedDays.length > 0}
+                            {finance.failedDays.length} дн. не загрузилось — в итог не вошли
+                        {:else if finance.emptyDays.length > 0}
+                            {finance.emptyDays.length} дн. без начислений
+                        {:else}
+                            все дни периода
+                        {/if}
+                    </span>
+                </div>
+            </div>
+
+            {#if finance.failedDays.length > 0}
+                <div class="panel glass-panel state-note" role="alert">
+                    <p>
+                        Часть дней не загрузилась, и в суммы они не подставлены нулём:
+                        {finance.failedDays
+                            .slice(0, 3)
+                            .map((day) => day.date)
+                            .join(", ")}{finance.failedDays.length > 3
+                            ? ` и ещё ${finance.failedDays.length - 3}`
+                            : ""}.
+                    </p>
+                    <p class="muted-note">
+                        {finance.failedDays[0]?.error ?? ""}
+                    </p>
+                </div>
+            {/if}
+
+            <div class="breakdown-grid">
+                <div class="panel glass-panel">
+                    <span class="panel-title-row">
+                        <h3 class="panel-title">Из чего складывается по заказам</h3>
+                        <InfoTip
+                            text="Удержания, привязанные к отправлениям, сгруппированные по смыслу. Сумма строк не равна итогу: итог берётся из начислений как есть, а здесь показано, из чего он состоит."
+                            label="Пояснение к удержаниям"
+                        />
+                    </span>
+                    {#if financeGroups.length === 0}
+                        <p class="muted-note">Нет начислений за период.</p>
+                    {:else}
+                        <div class="mini-list">
+                            {#each financeGroups as row (row.group)}
+                                <div class="mini-row">
+                                    <span class="mini-name"
+                                        >{FEE_GROUP_LABELS[row.group]}</span
+                                    >
+                                    <span class="mini-value"
+                                        >{formatCurrency(row.amount)}</span
+                                    >
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                </div>
+
+                <div class="panel glass-panel">
+                    <span class="panel-title-row">
+                        <h3 class="panel-title">Расходы кабинета по видам</h3>
+                        <InfoTip
+                            text="Начисления без номера отправления: хранение, продвижение, сбор отзывов и прочее. Они относятся к кабинету целиком, поэтому не размазываются по заказам."
+                            label="Пояснение к расходам кабинета"
+                        />
+                    </span>
+                    {#if finance.cabinetLines.length === 0}
+                        <p class="muted-note">Расходов кабинета за период нет.</p>
+                    {:else}
+                        <div class="mini-list">
+                            {#each finance.cabinetLines as line (line.key)}
+                                <div class="mini-row">
+                                    <span class="mini-name" title={line.label}
+                                        >{line.label}</span
+                                    >
+                                    <span class="mini-value"
+                                        >{formatCurrency(line.amount)}</span
+                                    >
+                                </div>
+                            {/each}
+                        </div>
+                    {/if}
+                </div>
+
+                {#if finance.orderLines.length > 0}
+                    <div class="panel glass-panel">
+                        <span class="panel-title-row">
+                            <h3 class="panel-title">Все удержания по типам</h3>
+                            <InfoTip
+                                text="Полный список типов начислений с суммами. Названия приходят из справочника Ozon; если название неизвестно, показывается идентификатор типа, а не выдуманная подпись."
+                                label="Пояснение к типам начислений"
+                            />
+                        </span>
+                        <div class="mini-list">
+                            {#each finance.orderLines.slice(0, 12) as line (line.key)}
+                                <div class="mini-row">
+                                    <span class="mini-name" title={line.label}
+                                        >{line.label}</span
+                                    >
+                                    <span class="mini-value"
+                                        >{formatCurrency(line.amount)}</span
+                                    >
+                                </div>
+                            {/each}
+                        </div>
+                    </div>
+                {/if}
+            </div>
+        {/if}
     </section>
 
     <section class="insights-section">
@@ -3033,5 +3304,15 @@
         display: block;
         font-size: 0.7rem;
         color: var(--text-muted);
+    }
+
+    /* Freshness of the financial layer, shown next to its title. */
+    .freshness {
+        margin-left: auto;
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        white-space: nowrap;
     }
 </style>

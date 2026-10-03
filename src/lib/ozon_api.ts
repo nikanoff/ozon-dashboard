@@ -1,11 +1,19 @@
 import { get } from 'svelte/store';
 import { ozonKeys } from './stores/ozon_keys';
 import type { DashboardPayload, StocksPayload } from './ozon_types';
+import type { AccrualDaySummary } from './accruals';
 
 export interface OzonApiError extends Error {
     status: number;
     /** Raw response body from the endpoint, if available. */
     payload: unknown;
+}
+
+export interface EconomicsPayload {
+    days: AccrualDaySummary[];
+    /** `type_id` to a name; empty when the caller already holds the catalogue. */
+    types: Record<string, string>;
+    fetchedAt: string;
 }
 
 function makeError(response: Response, payload: unknown): OzonApiError {
@@ -72,4 +80,22 @@ export function getDashboardData(signal?: AbortSignal, since?: string) {
 /** Stock rows and their images for the inventory page. */
 export function getStocksData(signal?: AbortSignal) {
     return callBundle<StocksPayload>('/api/stocks', signal);
+}
+
+/**
+ * Financial accruals for specific days.
+ *
+ * Days rather than a range: a closed day never changes, so only the days still missing
+ * from the local cache are requested. `withTypes` asks for the static type catalogue,
+ * which is only needed until it has been stored once.
+ */
+export function getEconomicsData(
+    signal: AbortSignal | undefined,
+    dates: string[],
+    withTypes = false
+) {
+    return callBundle<EconomicsPayload>('/api/economics', signal, {
+        dates,
+        withTypes
+    });
 }

@@ -107,7 +107,7 @@ async function callOzon<T>(
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Retries rate-limited calls instead of failing the whole page. */
-async function callOzonWithRetry<T>(
+export async function callOzonWithRetry<T>(
     path: string,
     body: unknown,
     credentials: Credentials,
@@ -134,7 +134,7 @@ async function callOzonWithRetry<T>(
 }
 
 /** Runs `worker` over `items` with a bounded number of calls in flight. */
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
     items: T[],
     limit: number,
     worker: (item: T, index: number) => Promise<R>
