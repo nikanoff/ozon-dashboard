@@ -3,6 +3,7 @@ import {
     cabinetFees,
     classifyFee,
     groupTotals,
+    moneyInTransit,
     orderFees,
     summariseFinance,
     typeLabel
@@ -201,5 +202,102 @@ describe('groupTotals', () => {
 
     it('omits groups that net to zero', () => {
         expect(groupTotals([{ key: '1', label: 'x', amount: 0, group: 'ads' }])).toEqual([]);
+    });
+});
+
+describe('moneyInTransit', () => {
+    const NOW = new Date(2026, 8, 16, 12, 0, 0);
+
+    const delivered = (postingNumber: string, daysAgo: number, payout: number | null) => ({
+        posting_number: postingNumber,
+        status: 'delivered',
+        created_at: new Date(NOW.getTime() - daysAgo * 24 * 60 * 60 * 1000).toISOString(),
+        expectedPayout: payout
+    });
+
+    const accruedDay = (postings: string[]): AccrualDaySummary =>
+        day('2026-09-15', {
+            byPosting: Object.fromEntries(postings.map((posting) => [posting, 100]))
+        });
+
+    it('counts a delivered order that Ozon has not accrued for yet', () => {
+        const result = moneyInTransit(
+            [accruedDay(['A-1'])],
+            [delivered('A-1', 3, 700), delivered('A-2', 2, 500)],
+            NOW
+        );
+
+        expect(result.orders).toBe(1);
+        expect(result.expectedPayout).toBe(500);
+        expect(result.priced).toBe(1);
+        expect(result.postingNumbers).toEqual(['A-2']);
+    });
+
+    it('stays silent when no day carries per-posting detail', () => {
+        const result = moneyInTransit([day('2026-09-15')], [delivered('A-1', 1, 700)], NOW);
+
+        // Without the detail every delivered order would look unpaid, so it reports nothing.
+        expect(result.orders).toBe(0);
+        expect(result.expectedPayout).toBeNull();
+    });
+
+    it('ignores orders that are not delivered yet', () => {
+        const result = moneyInTransit(
+            [accruedDay([])],
+            [
+                { ...delivered('A-1', 1, 700), status: 'delivering' },
+                { ...delivered('A-2', 1, 700), status: 'cancelled' }
+            ],
+            NOW
+        );
+
+        expect(result.orders).toBe(0);
+    });
+
+    it('ignores orders older than the window that keeps detail', () => {
+        const result = moneyInTransit(
+            [accruedDay([])],
+            [delivered('OLD', 40, 700), delivered('NEW', 2, 300)],
+            NOW
+        );
+
+        expect(result.orders).toBe(1);
+        expect(result.expectedPayout).toBe(300);
+    });
+
+    it('reports how many pending orders could be priced', () => {
+        const result = moneyInTransit(
+            [accruedDay([])],
+            [delivered('A-1', 1, null), delivered('A-2', 1, 400)],
+            NOW
+        );
+
+        expect(result.orders).toBe(2);
+        expect(result.priced).toBe(1);
+        expect(result.expectedPayout).toBe(400);
+    });
+
+    it('has no amount when none of the pending orders has a payout', () => {
+        const result = moneyInTransit([accruedDay([])], [delivered('A-1', 1, null)], NOW);
+
+        expect(result.expectedPayout).toBeNull();
+    });
+
+    it('lists the largest amounts first and caps the list', () => {
+        const postings = Array.from({ length: 8 }, (_, index) =>
+            delivered(`A-${index}`, 1, index * 100)
+        );
+
+        const result = moneyInTransit([accruedDay([])], postings, NOW);
+
+        expect(result.postingNumbers).toHaveLength(5);
+        expect(result.postingNumbers[0]).toBe('A-7');
+    });
+
+    it('is empty-safe', () => {
+        const result = moneyInTransit([], [], NOW);
+
+        expect(result.orders).toBe(0);
+        expect(result.expectedPayout).toBeNull();
     });
 });

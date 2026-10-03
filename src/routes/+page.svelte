@@ -11,7 +11,7 @@
         windowDays as accrualWindowDays,
         type AccrualCache,
     } from "$lib/accrual_cache";
-    import { summariseFinance, groupTotals, FEE_GROUP_LABELS } from "$lib/pnl";
+    import { summariseFinance, groupTotals, moneyInTransit, FEE_GROUP_LABELS } from "$lib/pnl";
     import {
         mergeDashboardPayload,
         needsFullLoad,
@@ -137,6 +137,14 @@
     // fetched once and kept in localStorage. Closed days never change, so later visits
     // ask only for the two trailing days instead of walking all 31 again.
     const FINANCE_WINDOW_DAYS = 31;
+
+    // Order-derived state first: the money and margin blocks below both build on it.
+    const postingsData = $derived($dashboardData?.postings ?? []);
+    // Cancelled orders earn nothing, so every money figure leaves them out.
+    const paidPostings = $derived(
+        postingsData.filter((posting) => posting.status !== "cancelled"),
+    );
+    const error = $derived($swrError?.message ?? null);
     const accrualWindow = $derived(accrualWindowDays(new Date(), FINANCE_WINDOW_DAYS));
 
     function accrualStorageKey() {
@@ -220,6 +228,25 @@
     const financeGroups = $derived(groupTotals(finance.orderLines));
     const financeLoadError = $derived($financeError?.message ?? null);
 
+    // Delivered orders Ozon has not accrued for yet: normal for a day or two, a payout
+    // delay or a broken feed beyond that.
+    const inTransit = $derived(
+        moneyInTransit(
+            accrualDays,
+            paidPostings.map((posting) => ({
+                posting_number: posting.posting_number,
+                status: posting.status,
+                created_at: posting.created_at,
+                expectedPayout: posting.financial_products.reduce<number | null>(
+                    (sum, row) =>
+                        typeof row.payout === "number" ? (sum ?? 0) + row.payout : sum,
+                    null,
+                ),
+            })),
+            new Date(),
+        ),
+    );
+
     // Reload when the credentials change; useSWR already loads the initial value.
     // Both requests are reset first, so the previous account's payload is dropped
     // before the new one is fetched — otherwise it would stay on screen and get
@@ -256,9 +283,6 @@
     /** Colors for the three window series (7 / 14 / 31 days). */
     const SERIES_COLORS = ["#6366f1", "#a855f7", "#eab308"];
     const seriesColor = (index: number) => SERIES_COLORS[index] ?? "#71717a";
-
-    const postingsData = $derived($dashboardData?.postings ?? []);
-    const error = $derived($swrError?.message ?? null);
 
     // The skeleton state owns the whole analytics area: without it every figure
     // would render as a zero while the 31-day load is still running, which reads as
@@ -343,11 +367,8 @@
     //
     // Ozon reports `payout` and `commission_amount` inside `financial_data` of the
     // same free endpoint the orders come from, so unit economics needs no paid
-    // method. Cancelled orders earn nothing, hence they are left out.
+    // method. Cancelled orders were already filtered out above.
     const MONEY_WINDOW_DAYS = 31;
-    const paidPostings = $derived(
-        postingsData.filter((posting) => posting.status !== "cancelled"),
-    );
     const moneyWindow = $derived.by(() => {
         const since = Date.now() - MONEY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
         return paidPostings.filter((posting) => {
@@ -1190,6 +1211,24 @@
                             {finance.emptyDays.length} дн. без начислений
                         {:else}
                             все дни периода
+                        {/if}
+                    </span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Ещё не начислено</span>
+                    <span class="kpi-value"
+                        >{inTransit.expectedPayout === null
+                            ? `${inTransit.orders} заказ.`
+                            : formatCurrency(inTransit.expectedPayout)}</span
+                    >
+                    <span class="kpi-delta">
+                        {#if inTransit.orders === 0}
+                            доставленные заказы все с начислениями
+                        {:else}
+                            {inTransit.orders} доставленных за {inTransit.windowDays} дн.
+                            {#if inTransit.priced < inTransit.orders}
+                                · по {inTransit.orders - inTransit.priced} сумм нет
+                            {/if}
                         {/if}
                     </span>
                 </div>
