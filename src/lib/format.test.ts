@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     formatCurrency,
     formatCurrencyParts,
+    formatDay,
     formatDelta,
     formatNumber,
     formatPercent
@@ -67,5 +68,22 @@ describe('formatNumber', () => {
     it('groups thousands', () => {
         expect(formatNumber(1000)).not.toBe('1000');
         expect(formatNumber(42)).toBe('42');
+    });
+});
+
+describe('formatDay', () => {
+    it('turns a key into a dotted date, as the rest of the page writes them', () => {
+        expect(formatDay('2026-09-01')).toBe('01.09.2026');
+        expect(formatDay('2025-08-31')).toBe('31.08.2025');
+    });
+
+    it('is a dash when there is no date', () => {
+        expect(formatDay(null)).toBe('—');
+        expect(formatDay(undefined)).toBe('—');
+        expect(formatDay('')).toBe('—');
+    });
+
+    it('passes an unrecognisable value through rather than inventing a date', () => {
+        expect(formatDay('не дата')).toBe('не дата');
     });
 });

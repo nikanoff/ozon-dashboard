@@ -27,6 +27,38 @@ import { costAt, type CostBook } from './costs';
  */
 export type CostLookup = (offerId: string, sku: number, at: Date) => number | undefined;
 
+/**
+ * Reads commission from either shape Ozon uses.
+ *
+ * A live account returns `commission: { amount: -936, percent: 52 }`; the documentation
+ * shows flat `commission_amount` / `commission_percent` fields. `amount` is negative in
+ * the live response, and commission is a cost, so the magnitude is what callers want.
+ */
+export function readCommission(row: OzonFinancialProduct | undefined): {
+    amount: number | null;
+    percent: number | null;
+} {
+    const nested = row?.commission;
+    const nestedAmount =
+        typeof nested?.amount === 'number' && Number.isFinite(nested.amount)
+            ? Math.abs(nested.amount)
+            : null;
+    const flatAmount =
+        typeof row?.commission_amount === 'number' && Number.isFinite(row.commission_amount)
+            ? Math.abs(row.commission_amount)
+            : null;
+
+    const amount = nestedAmount ?? flatAmount;
+    const percent =
+        typeof nested?.percent === 'number'
+            ? nested.percent
+            : typeof row?.commission_percent === 'number'
+              ? row.commission_percent
+              : null;
+
+    return { amount, percent };
+}
+
 /** A posting line joined with its financial row. */
 export interface EnrichedLine {
     /** Position in the posting's `products[]`. */
@@ -86,6 +118,7 @@ export function enrichLines(posting: DashboardPosting): EnrichedLine[] {
     return products.map((product, index) => {
         const money = moneyFor(product, index);
         const quantity = product.quantity || 1;
+        const commission = readCommission(money);
 
         return {
             index,
@@ -95,8 +128,8 @@ export function enrichLines(posting: DashboardPosting): EnrichedLine[] {
             quantity,
             gross: productUnitPrice(product) * quantity,
             payout: numberOrNull(money?.payout),
-            commission: numberOrNull(money?.commission_amount),
-            commissionPercent: numberOrNull(money?.commission_percent),
+            commission: commission.amount,
+            commissionPercent: commission.percent,
             discountValue: numberOrNull(money?.total_discount_value),
             oldPrice: numberOrNull(money?.old_price),
             actions: money?.actions ?? []
@@ -106,32 +139,48 @@ export function enrichLines(posting: DashboardPosting): EnrichedLine[] {
 
 /** Posting-level money totals. */
 export interface MoneySummary {
-    /** Seller revenue before Ozon's deductions — the buyer's money. */
+    /** Seller revenue before Ozon's deductions — the buyer's money, over every line. */
     gross: number;
-    /** Commission Ozon keeps, over the lines that reported it. */
+    /** Commission Ozon keeps, over the settled lines. */
     commission: number;
-    /** What the seller keeps, over the lines that reported it. */
+    /** What the seller keeps, over the settled lines. */
     payout: number;
-    /** Discount given away, over the lines that reported it. */
-    discountValue: number;
     units: number;
-    /** Lines with a reported payout, and lines overall. */
+    /**
+     * Price of the lines Ozon has calculated, so `commission + payout === settledGross`.
+     *
+     * The identity was checked against a live month: 389 of 396 delivered lines satisfy it
+     * exactly, and the seven that do not are delivered but not yet calculated — they report
+     * a real price with zero commission and zero payout.
+     */
+    settledGross: number;
+    /**
+     * Price of the lines Ozon has not calculated yet.
+     *
+     * A line counts as unsettled when it reports neither commission nor payout while carrying
+     * a price: that is what an order in transit looks like, and also what a delivered order
+     * looks like until the settlement runs. Their money is not yet determined, so they are
+     * kept out of the ratios rather than counted as zero — which is what made the commission
+     * rate read low and the three figures refuse to add up.
+     */
+    pendingGross: number;
+    /** Lines with calculated money, and lines overall. */
     reportedLines: number;
     totalLines: number;
-    /** `payout / gross` over reported lines; `null` when nothing was reported. */
+    /** `payout / settledGross`; `null` when nothing is settled. */
     payoutRatio: number | null;
-    /** `commission / gross` over reported lines; `null` when nothing was reported. */
+    /** `commission / settledGross`; `null` when nothing is settled. */
     commissionRate: number | null;
-    /** True when every line reported money, so the ratios describe the whole period. */
+    /** True when nothing is left uncalculated, so the ratios describe the whole period. */
     complete: boolean;
 }
 
 export function moneySummary(postings: DashboardPosting[]): MoneySummary {
     let gross = 0;
-    let reportedGross = 0;
+    let settledGross = 0;
+    let pendingGross = 0;
     let commission = 0;
     let payout = 0;
-    let discountValue = 0;
     let units = 0;
     let reportedLines = 0;
     let totalLines = 0;
@@ -142,13 +191,21 @@ export function moneySummary(postings: DashboardPosting[]): MoneySummary {
             units += line.quantity;
             gross += line.gross;
 
-            if (line.payout === null) continue;
+            if (line.payout === null) {
+                pendingGross += line.gross;
+                continue;
+            }
+
+            // Zero on both sides means Ozon has not run the settlement for this line yet.
+            if (line.payout === 0 && (line.commission ?? 0) === 0) {
+                pendingGross += line.gross;
+                continue;
+            }
 
             reportedLines += 1;
-            reportedGross += line.gross;
+            settledGross += line.gross;
             payout += line.payout;
             commission += line.commission ?? 0;
-            discountValue += line.discountValue ?? 0;
         }
     }
 
@@ -156,19 +213,81 @@ export function moneySummary(postings: DashboardPosting[]): MoneySummary {
         gross,
         commission,
         payout,
-        discountValue,
         units,
+        settledGross,
+        pendingGross,
         reportedLines,
         totalLines,
-        payoutRatio: reportedGross > 0 ? payout / reportedGross : null,
-        commissionRate: reportedGross > 0 ? commission / reportedGross : null,
-        complete: totalLines > 0 && reportedLines === totalLines
+        payoutRatio: settledGross > 0 ? payout / settledGross : null,
+        commissionRate: settledGross > 0 ? commission / settledGross : null,
+        complete: totalLines > 0 && pendingGross === 0
+    };
+}
+
+/**
+ * The commission rate per article, over the loaded period.
+ *
+ * Ozon's rate is not one number for the account: measured over a September of 20 articles it
+ * ran from 17 % to 52 %, while the account-wide blend read 51 % because two articles carried
+ * most of the revenue. The blend answers nothing a seller can price against; the per-article
+ * rate does.
+ *
+ * A period figure, not a property of the article. Within that one month an article's rate
+ * looked stable, but Ozon revises commission rates, so the value here describes the loaded
+ * days and no more — do not treat it as the rate that will apply next month.
+ *
+ * Measured on settled lines only. An order Ozon has not calculated reports a zero commission,
+ * and averaging those in would pull every article's rate towards zero.
+ */
+export interface CommissionSpread {
+    /** `costKey` of the article to its commission share, 0..1. */
+    byKey: Map<string, number>;
+    /** Lowest and highest article rate, `null` when nothing is settled. */
+    min: number | null;
+    max: number | null;
+    /** Median article rate — the middle one, not a weighted average. */
+    median: number | null;
+    /** How many articles the rates were measured over. */
+    articles: number;
+}
+
+export function commissionSpread(postings: DashboardPosting[]): CommissionSpread {
+    const totals = new Map<string, { gross: number; commission: number }>();
+
+    for (const posting of postings) {
+        if (posting.status === 'cancelled') continue;
+
+        for (const line of enrichLines(posting)) {
+            const settled =
+                line.payout !== null && (line.payout !== 0 || (line.commission ?? 0) !== 0);
+            if (!settled) continue;
+
+            const key = costKey(line.offerId, line.sku);
+            const entry = totals.get(key) ?? { gross: 0, commission: 0 };
+            entry.gross += line.gross;
+            entry.commission += line.commission ?? 0;
+            totals.set(key, entry);
+        }
+    }
+
+    const byKey = new Map<string, number>();
+    for (const [key, entry] of totals) {
+        if (entry.gross > 0) byKey.set(key, entry.commission / entry.gross);
+    }
+
+    const rates = [...byKey.values()].sort((a, b) => a - b);
+
+    return {
+        byKey,
+        min: rates.length > 0 ? rates[0] : null,
+        max: rates.length > 0 ? rates[rates.length - 1] : null,
+        median: rates.length > 0 ? rates[Math.floor(rates.length / 2)] : null,
+        articles: rates.length
     };
 }
 
 /** Unit economics for one SKU. */
-export interface SkuEconomics {
-    /** Cost lookup key: the seller's article, falling back to the SKU. */
+export interface SkuEconomics {    /** Cost lookup key: the seller's article, falling back to the SKU. */
     key: string;
     sku: number;
     offerId: string;

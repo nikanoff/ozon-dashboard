@@ -1,4 +1,5 @@
 import { writable, type Writable } from 'svelte/store';
+import { isProgrammingError } from './failures';
 
 export interface SWROptions<T> {
     dedupingInterval?: number;
@@ -123,6 +124,13 @@ export function useSWR<T>(
                 // An abort is a teardown, not a failure worth showing the user.
                 if (!isAbortError(e) && isCurrent()) {
                     error.set(e);
+
+                    // A programming error is reported to the reader in plain language, so the
+                    // original text has to be kept somewhere it can be acted on. This is that
+                    // place: the console, next to the stack.
+                    if (isProgrammingError(e)) {
+                        console.error(`[${key}] запрос упал из-за ошибки в коде:`, e);
+                    }
                 }
             } finally {
                 // Only the live request owns the flags; after an eviction a newer

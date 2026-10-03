@@ -2,7 +2,7 @@ import { get } from 'svelte/store';
 import { ozonKeys } from './stores/ozon_keys';
 import type { DashboardPayload, StocksPayload } from './ozon_types';
 import type { AccrualDaySummary } from './accruals';
-import type { TurnoverRow } from './turnover';
+import type { MonthFinance } from './realization';
 
 export interface OzonApiError extends Error {
     status: number;
@@ -70,12 +70,17 @@ async function callBundle<T>(
  * Pass `since` to re-read only the recent tail of the history; the caller merges
  * that into the payload it already holds.
  */
-export function getDashboardData(signal?: AbortSignal, since?: string) {
-    return callBundle<DashboardPayload>(
-        '/api/dashboard',
-        signal,
-        since ? { since } : {}
-    );
+export function getDashboardData(
+    signal?: AbortSignal,
+    since?: string,
+    windowFrom?: string,
+    windowTo?: string
+) {
+    return callBundle<DashboardPayload>('/api/dashboard', signal, {
+        ...(since ? { since } : {}),
+        ...(windowFrom ? { windowFrom } : {}),
+        ...(windowTo ? { windowTo } : {})
+    });
 }
 
 /** Stock rows and their images for the inventory page. */
@@ -101,21 +106,19 @@ export function getEconomicsData(
     });
 }
 
-export interface TurnoverPayload {
-    rows: TurnoverRow[];
-    /** True when Ozon holds more rows than came back. */
-    truncated: boolean;
-    /** A refusal or failure, in which case `rows` is empty. */
-    error: string | null;
-    fetchedAt: string;
+
+/** One month of realization, balance and weekly settlement. */
+export interface MonthFinancePayload extends MonthFinance {
+    /** Set when the balance or the weekly breakdown failed; the month still renders. */
+    partialError?: string;
 }
 
 /**
- * Ozon's turnover grades.
+ * A single month of financial figures.
  *
- * Rate-limited to one request per minute upstream, so the caller is expected to cache and
- * ask rarely.
+ * This is what reaches months the order feed cannot: Ozon's realization report is a monthly
+ * document served for any month, so a month older than the loaded postings still answers.
  */
-export function getTurnoverData(signal?: AbortSignal) {
-    return callBundle<TurnoverPayload>('/api/turnover', signal);
+export function getMonthFinance(signal: AbortSignal | undefined, month: string) {
+    return callBundle<MonthFinancePayload>('/api/finance', signal, { month });
 }

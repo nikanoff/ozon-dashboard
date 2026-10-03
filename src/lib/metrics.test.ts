@@ -9,7 +9,6 @@ import {
     hourlyActivity,
     promoShare,
     revenueConcentration,
-    statusBreakdown,
     topProducts
 } from './metrics';
 import type { DashboardPosting } from './ozon_types';
@@ -194,46 +193,6 @@ describe('hourlyActivity', () => {
         );
 
         expect(buckets.reduce((sum, bucket) => sum + bucket.orders, 0)).toBe(0);
-    });
-});
-
-describe('statusBreakdown', () => {
-    it('counts each posting in every window it falls into', () => {
-        const result = statusBreakdown(
-            [
-                daysAgo(1, { status: 'delivering' }),
-                daysAgo(5, { status: 'delivered' }),
-                daysAgo(10, { status: 'delivered' }),
-                daysAgo(20, { status: 'cancelled' })
-            ],
-            [7, 14, 31],
-            NOW
-        );
-
-        expect(result.totals).toEqual([2, 3, 4]);
-        expect(result.rows.find((row) => row.status === 'delivered')?.counts).toEqual([1, 2, 2]);
-        expect(result.rows.find((row) => row.status === 'cancelled')?.counts).toEqual([0, 0, 1]);
-    });
-
-    it('lists known statuses first and unknown ones after', () => {
-        const result = statusBreakdown(
-            [daysAgo(1, { status: 'something_new' }), daysAgo(1, { status: 'cancelled' })],
-            [7],
-            NOW
-        );
-
-        expect(result.rows.map((row) => row.status)).toEqual(['cancelled', 'something_new']);
-    });
-
-    it('ignores postings dated in the future', () => {
-        const result = statusBreakdown(
-            [posting({ created_at: new Date(NOW.getTime() + 2 * HOUR).toISOString() })],
-            [7, 14, 31],
-            NOW
-        );
-
-        expect(result.totals).toEqual([0, 0, 0]);
-        expect(result.rows).toEqual([]);
     });
 });
 

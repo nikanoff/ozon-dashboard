@@ -48,10 +48,19 @@ export interface OzonPostingProduct {
 /**
  * One row of `financial_data.products[]`.
  *
- * This is the only place the free tier exposes money the seller actually keeps:
- * `payout` and `commission_amount` come straight from Ozon, so unit economics does
- * not need a paid method. The fields are declared as they appear in the v2 docs;
- * v3 is expected to match, which the first live call has to confirm.
+ * This is the only place the free tier exposes money the seller actually keeps, so unit
+ * economics needs no paid method. Two details were confirmed against a live account and
+ * both differ from the documentation:
+ *
+ *   - `commission` is an **object** (`{ amount, percent, currency }`), not the flat
+ *     `commission_amount` / `commission_percent` pair the docs show, and its `amount`
+ *     arrives **negative**;
+ *   - `payout` equals `price - |commission|`: it does **not** include logistics, handling
+ *     or acquiring. Those are charged later, in the accruals. Presenting `payout` as the
+ *     amount transferred to the account overstates the money by the logistics cost —
+ *     verified on a live order where the accrual came to 102.53 ₽ less.
+ *
+ * The flat fields are kept as a fallback so both shapes parse.
  *
  * Known defect: `quantity` here is unreliable — some FBO postings omit it or send
  * `"0\""`. Always take the quantity from the top-level `products[]` instead.
@@ -59,11 +68,13 @@ export interface OzonPostingProduct {
 export interface OzonFinancialProduct {
     /** Matches `products[].sku` in the documented example, but not guaranteed to. */
     product_id?: number;
-    /** What the seller receives for this line, per the order card. */
+    /** What the seller keeps for this line, before logistics and acquiring. */
     payout?: number;
-    /** Commission Ozon keeps, in currency units. */
+    /** Commission Ozon keeps, as an object whose `amount` is negative. */
+    commission?: { amount?: number; percent?: number; currency?: string };
+    /** Fallback shape: commission as a plain amount. */
     commission_amount?: number;
-    /** Effective commission rate for this line, in percent. */
+    /** Fallback shape: commission rate, in percent. */
     commission_percent?: number;
     /** Line price and the price before discount. */
     price?: number;
@@ -181,6 +192,16 @@ export interface DashboardPayload {
     fetchedAt: string;
     /** Postings older than this fall outside the dashboard's widest period. */
     oldestAllowed: string;
+    /**
+     * The ranges this payload actually holds, as `YYYY-MM-DD` pairs, oldest first.
+     *
+     * Two of them when an old month is on screen: the month, and today's tail, with the
+     * months between them never fetched. `oldestAllowed` cannot describe that shape — it is
+     * the earliest edge, so a payload holding August 2025 beside September 2026 reports
+     * August 2025 and looks as though it covers everything after it. Deciding whether a
+     * refresh can be merged needs the ranges themselves, which is why they are here.
+     */
+    ranges?: Array<{ from: string; to: string }>;
 }
 
 export interface StocksPayload {

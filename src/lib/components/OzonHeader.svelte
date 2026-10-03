@@ -36,7 +36,7 @@
 </script>
 
 <header class="header">
-    <div class="header-content">
+    <div>
         <h1><a href={titleHref} class="title-link">{title}</a></h1>
         <p class="subtitle">
             {subtitle}: {$ozonKeys.clientId || "Not Configured"}

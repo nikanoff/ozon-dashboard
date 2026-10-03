@@ -5,7 +5,6 @@ import {
     type CostPoint,
     mergeCosts,
     parseCostList,
-    removeCost,
     setCost,
     toCostList
 } from '../costs';
@@ -74,11 +73,6 @@ if (browser) {
 /** Sets the current cost of one product, keeping earlier values for older periods. */
 export function recordCost(key: string, unitCost: number, from?: string) {
     costBook.update((book) => setCost(book, key, unitCost, from));
-}
-
-/** Forgets one product's whole cost history. */
-export function forgetCost(key: string) {
-    costBook.update((book) => removeCost(book, key));
 }
 
 /** Drops the entire book, for a "clear all" action. */

@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
     abcAnalysis,
     breakEvenPrice,
+    commissionSpread,
+    costBookLookup,
     costKey,
     enrichLines,
     lossMaking,
     moneySummary,
     skuEconomics
 } from './economics';
+import { setCost } from './costs';
 import type { DashboardPosting } from './ozon_types';
 
 /** A posting with one line priced 1000 and the given financial row. */
@@ -95,6 +98,62 @@ describe('enrichLines', () => {
     });
 });
 
+describe('commissionSpread', () => {
+    /** One settled line of the given article: price 1000, quantity 1. */
+    const line = (offerId: string, payout: number, commission: number) =>
+        posting(
+            { payout, commission_amount: commission },
+            {
+                products: [
+                    {
+                        offer_id: offerId,
+                        name: offerId,
+                        sku: 1,
+                        quantity: 1,
+                        price: { amount: '1000', currency: 'RUB' }
+                    }
+                ]
+            }
+        );
+
+    it('measures the rate per article, not one rate for the account', () => {
+        const spread = commissionSpread([line('a', 500, 500), line('b', 900, 100)]);
+
+        expect(spread.articles).toBe(2);
+        expect(spread.byKey.get('a')).toBeCloseTo(0.5);
+        expect(spread.byKey.get('b')).toBeCloseTo(0.1);
+        expect(spread.min).toBeCloseTo(0.1);
+        expect(spread.max).toBeCloseTo(0.5);
+    });
+
+    it('leaves unsettled lines out, so their zero commission cannot dilute a rate', () => {
+        const spread = commissionSpread([line('a', 500, 500), line('a', 0, 0)]);
+
+        expect(spread.byKey.get('a')).toBeCloseTo(0.5);
+        expect(spread.max).toBeCloseTo(0.5);
+        expect(spread.articles).toBe(1);
+    });
+
+    it('ignores cancelled orders', () => {
+        const spread = commissionSpread([
+            line('a', 500, 500),
+            { ...line('b', 100, 1900), status: 'cancelled' }
+        ]);
+
+        expect(spread.articles).toBe(1);
+        expect(spread.byKey.has('b')).toBe(false);
+    });
+
+    it('is empty-safe', () => {
+        const spread = commissionSpread([]);
+
+        expect(spread.min).toBeNull();
+        expect(spread.median).toBeNull();
+        expect(spread.max).toBeNull();
+        expect(spread.articles).toBe(0);
+    });
+});
+
 describe('moneySummary', () => {
     it('separates buyer money from seller money', () => {
         const summary = moneySummary([
@@ -104,7 +163,6 @@ describe('moneySummary', () => {
         expect(summary.gross).toBe(2000);
         expect(summary.payout).toBe(1400);
         expect(summary.commission).toBe(600);
-        expect(summary.discountValue).toBe(500);
         expect(summary.payoutRatio).toBeCloseTo(0.7);
         expect(summary.commissionRate).toBeCloseTo(0.3);
         expect(summary.complete).toBe(true);
@@ -130,6 +188,40 @@ describe('moneySummary', () => {
         expect(summary.payoutRatio).toBeNull();
         expect(summary.commissionRate).toBeNull();
         expect(summary.complete).toBe(false);
+    });
+
+    it('treats zero commission and zero payout as not yet calculated', () => {
+        // The live shape of an order Ozon has not settled: a real price, and zeroes where the
+        // money will appear. Counting it as reported dragged the commission rate down and left
+        // the three figures unable to add up.
+        const summary = moneySummary([
+            posting({ payout: 0, commission_amount: 0 }),
+            posting({ payout: 1400, commission_amount: 600 })
+        ]);
+
+        expect(summary.settledGross).toBe(2000);
+        expect(summary.pendingGross).toBe(2000);
+        expect(summary.reportedLines).toBe(1);
+        expect(summary.commissionRate).toBeCloseTo(0.3);
+        expect(summary.complete).toBe(false);
+    });
+
+    it('makes commission and payout add up to the settled lines', () => {
+        // The identity that holds for every settled line, and the reason the block can be read
+        // as a chain: commission + payout = the price of what Ozon has calculated.
+        const summary = moneySummary([
+            posting({ payout: 1400, commission_amount: 600 }),
+            posting({ payout: 0, commission_amount: 0 }),
+            posting({ payout: 900, commission_amount: 1100 })
+        ]);
+
+        expect(summary.commission + summary.payout).toBeCloseTo(summary.settledGross, 2);
+        expect(summary.settledGross).toBe(4000);
+    });
+
+    it('is complete only when nothing is left uncalculated', () => {
+        expect(moneySummary([posting({ payout: 100, commission_amount: 50 })]).complete).toBe(true);
+        expect(moneySummary([posting({ payout: 0, commission_amount: 0 })]).complete).toBe(false);
     });
 
     it('is empty-safe', () => {
@@ -294,6 +386,47 @@ describe('lossMaking', () => {
 
         const unknown = skuEconomics([posting({ payout: 700 })], () => undefined);
         expect(lossMaking(unknown)).toHaveLength(0);
+    });
+});
+
+describe('costBookLookup', () => {
+    it('resolves a past date from a cost entered today', () => {
+        // The seller enters a cost now and expects to see the margin for a finished month.
+        // `costAt` carries the earliest known point backwards, so the lookup must answer
+        // rather than report the cost as missing.
+        const book = setCost({}, 'suitcasecoverredrabbit', 420, '2026-10-03');
+        const lookup = costBookLookup(book);
+
+        expect(lookup('suitcasecoverredrabbit', 2103351437, new Date(2026, 8, 30))).toBe(420);
+        expect(lookup('suitcasecoverredrabbit', 2103351437, new Date(2026, 0, 15))).toBe(420);
+    });
+
+    it('prefers the point that applied at the time when there is one', () => {
+        const book = setCost(
+            setCost({}, 'case', 300, '2026-01-01'),
+            'case',
+            400,
+            '2026-06-01'
+        );
+        const lookup = costBookLookup(book);
+
+        expect(lookup('case', 1, new Date(2026, 2, 15))).toBe(300);
+        expect(lookup('case', 1, new Date(2026, 8, 15))).toBe(400);
+    });
+
+    it('answers nothing for a product with no cost at all', () => {
+        const lookup = costBookLookup(setCost({}, 'known', 100, '2026-01-01'));
+
+        expect(lookup('unknown', 999, new Date(2026, 8, 15))).toBeUndefined();
+    });
+
+    it('keys by article, falling back to the sku when the article is empty', () => {
+        // Callers normalise a missing article to an empty string, so that is the case to
+        // pin: the cost must still be found by sku.
+        const book = { '2103351437': [{ from: '2026-01-01', unitCost: 250 }] };
+        const lookup = costBookLookup(book);
+
+        expect(lookup('', 2103351437, new Date(2026, 8, 15))).toBe(250);
     });
 });
 

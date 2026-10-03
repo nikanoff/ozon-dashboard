@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { capitalSummary, suggestedOrder, type CapitalInput } from './capital';
+import { capitalSummary, type CapitalInput } from './capital';
 import type { InventoryInsights, InventoryRow } from './inventory';
 import type { SkuEconomics } from './economics';
 
@@ -229,25 +229,5 @@ describe('capitalSummary', () => {
 
         expect(summary.turnoverRatio).toBeNull();
         expect(summary.gmroi).toBeNull();
-    });
-});
-
-describe('suggestedOrder', () => {
-    it('covers the gap between the target and what is on hand', () => {
-        // 2/day for 30 days = 60, minus 10 already in stock.
-        expect(suggestedOrder(2, 10, 30)).toBe(50);
-    });
-
-    it('never suggests a negative order', () => {
-        expect(suggestedOrder(1, 100, 30)).toBe(0);
-    });
-
-    it('suggests nothing without demand', () => {
-        expect(suggestedOrder(0, 0, 30)).toBe(0);
-        expect(suggestedOrder(Number.NaN, 5, 30)).toBe(0);
-    });
-
-    it('rounds up, because half a unit cannot be ordered', () => {
-        expect(suggestedOrder(0.5, 0, 5)).toBe(3);
     });
 });

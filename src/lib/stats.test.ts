@@ -93,6 +93,7 @@ describe('postingUnits', () => {
     });
 });
 
+
 describe('isCrossCluster', () => {
     it('is false for the same cluster', () => {
         expect(isCrossCluster(posting({ financial_data: { cluster_from: 'Yaroslavl`', cluster_to: 'Yaroslavl`' } }))).toBe(false);

@@ -45,6 +45,10 @@ export function toDashboardPosting(posting: OzonPosting): DashboardPosting {
         financial_products: financialProducts.map((row) => ({
             product_id: row.product_id,
             payout: row.payout,
+            // The live shape: an object whose `amount` is negative. Passing only the flat
+            // `commission_amount` fields here silently dropped the real commission, which
+            // left the dashboard reporting a zero commission on real orders.
+            commission: row.commission,
             commission_amount: row.commission_amount,
             commission_percent: row.commission_percent,
             price: row.price,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     collectFees,
+    isCabinetLevel,
     readAmount,
     summariseDay,
     toAccrual,
@@ -267,23 +268,58 @@ describe('summariseDay', () => {
 });
 
 describe('toTypeCatalogue', () => {
-    it('reads the flat envelope', () => {
-        expect(toTypeCatalogue({ types: [{ id: 301, name: 'Логистика' }] })).toEqual({
-            301: 'Логистика'
+    it('reads the live envelope, preferring the russian description', () => {
+        // Confirmed against a live account: `accrual_types`, with an English `name` and the
+        // Russian wording in `description`.
+        const catalogue = toTypeCatalogue({
+            accrual_types: [
+                { id: 1, name: 'Acquiring', description: 'Эквайринг' },
+                { id: 32, name: 'Logistics', description: 'Логистика' }
+            ]
+        });
+
+        expect(catalogue).toEqual({ 1: 'Эквайринг', 32: 'Логистика' });
+    });
+
+    it('falls back to the name when there is no description', () => {
+        expect(toTypeCatalogue({ accrual_types: [{ id: 5, name: 'BrandShelf' }] })).toEqual({
+            5: 'BrandShelf'
         });
     });
 
-    it('reads the enveloped variant', () => {
+    it('still reads the other envelopes', () => {
+        expect(toTypeCatalogue({ types: [{ id: 301, name: 'Логистика' }] })).toEqual({
+            301: 'Логистика'
+        });
         expect(toTypeCatalogue({ result: { types: [{ id: '1100', name: 'Эквайринг' }] } })).toEqual({
             1100: 'Эквайринг'
         });
     });
 
-    it('skips entries without an id or a name, and tolerates junk', () => {
+    it('skips entries without an id, and tolerates junk', () => {
         expect(
-            toTypeCatalogue({ types: [{ id: 1 }, { name: 'no id' }, { id: 2, name: 'ok' }, null] })
+            toTypeCatalogue({
+                accrual_types: [{ name: 'no id' }, { id: 2, name: 'ok' }, null, 'text']
+            })
         ).toEqual({ 2: 'ok' });
         expect(toTypeCatalogue(null)).toEqual({});
         expect(toTypeCatalogue({})).toEqual({});
+    });
+});
+
+describe('isCabinetLevel', () => {
+    it('treats NON_ITEM as cabinet even though it carries a document number', () => {
+        // Confirmed live: NON_ITEM rows send `unit_number` holding a document number, so a
+        // rule based on a missing number would file cabinet costs under orders.
+        expect(isCabinetLevel({ category: 'NON_ITEM', postingNumber: '2000066438191' })).toBe(true);
+    });
+
+    it('keeps POSTING and ITEM with their order', () => {
+        expect(isCabinetLevel({ category: 'POSTING', postingNumber: 'P-1' })).toBe(false);
+        expect(isCabinetLevel({ category: 'ITEM', postingNumber: 'P-1' })).toBe(false);
+    });
+
+    it('is cabinet when there is no number at all', () => {
+        expect(isCabinetLevel({ category: 'POSTING', postingNumber: null })).toBe(true);
     });
 });

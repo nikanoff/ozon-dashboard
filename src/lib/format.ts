@@ -52,3 +52,19 @@ export function formatDelta(value: number | null): string {
     if (value === null) return '—';
     return `${value >= 0 ? '+' : ''}${value.toFixed(1).replace('.', ',')}%`;
 }
+
+/**
+ * `2026-09-01` as `01.09.2026`, and `null` as an em dash.
+ *
+ * Dates elsewhere on the page are dotted, and a raw `YYYY-MM-DD` beside them read as a
+ * machine value rather than a date — which is how it appeared in a notice meant for the
+ * seller to act on.
+ */
+export function formatDay(value: string | null | undefined): string {
+    if (!value) return '—';
+
+    const [year, month, day] = value.split('-');
+    if (!year || !month || !day) return value;
+
+    return `${day}.${month}.${year}`;
+}

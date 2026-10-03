@@ -1,21 +1,40 @@
 <script lang="ts">
-    import { getDashboardData, getStocksData, getEconomicsData, getTurnoverData, type TurnoverPayload } from "$lib/ozon_api";
-    import { summariseTurnover, gradeLabel } from "$lib/turnover";
+    import { getDashboardData, getStocksData, getEconomicsData, getMonthFinance } from "$lib/ozon_api";
     import {
         cachedWindow,
         daysToFetch,
         emptyAccrualCache,
         mergeAccrualDays,
         pruneAccrualCache,
-        // Aliased: the page already has a `windowDays` state for the trend toggle.
-        windowDays as accrualWindowDays,
         type AccrualCache,
     } from "$lib/accrual_cache";
-    import { summariseFinance, groupTotals, moneyInTransit, FEE_GROUP_LABELS } from "$lib/pnl";
+    import {
+        dayKey,
+        daysOfMonth,
+        isInsidePeriod,
+        lastCompleteMonth,
+        monthLabel,
+        previousMonthKey,
+    } from "$lib/period";
+    import {
+        mergeCostCandidates,
+        monthBounds,
+        monthView,
+        payoutPeriods,
+        profitAfterTaxAndCost,
+        recentMonths,
+        serviceLabel,
+        taxableAmount,
+    } from "$lib/realization";
+    import { taxSettings, TAX_BASE_LABELS } from "$lib/stores/tax";
+    import type { TaxBase } from "$lib/realization";
+    import PeriodPicker from "$lib/components/PeriodPicker.svelte";
+    import { summariseFinance, moneyInTransit } from "$lib/pnl";
     import {
         mergeDashboardPayload,
         needsFullLoad,
         refreshSince,
+        coversWindow,
     } from "$lib/dashboard_cache";
     import type { DashboardPayload } from "$lib/ozon_types";
     import { peekCache, useSWR } from "$lib/swr";
@@ -38,19 +57,17 @@
         hourlyActivity,
         promoShare,
         revenueConcentration,
-        STATUS_LABELS,
-        statusBreakdown,
         topProducts,
     } from "$lib/metrics";
     import { inventoryInsights } from "$lib/inventory";
-    import { moneySummary, enrichLines, costBookLookup, skuEconomics, abcAnalysis, breakEvenPrice, lossMaking } from "$lib/economics";
-    import { capitalSummary, suggestedOrder } from "$lib/capital";
-    import { buildActions } from "$lib/actions";
+    import { enrichLines, costBookLookup, costKey, skuEconomics, abcAnalysis, breakEvenPrice, lossMaking, commissionSpread } from "$lib/economics";
+    import { capitalSummary } from "$lib/capital";
     import { costBook } from "$lib/stores/cogs";
     import CogsPanel from "$lib/components/CogsPanel.svelte";
     import {
         formatCurrency,
         formatCurrencyParts,
+        formatDay,
         formatDelta,
         formatNumber,
         formatPercent,
@@ -58,12 +75,69 @@
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import OzonHeader from "$lib/components/OzonHeader.svelte";
     import InfoTip from "$lib/components/InfoTip.svelte";
-    import RangeToggle from "$lib/components/RangeToggle.svelte";
     import { get } from "svelte/store";
     import { onDestroy } from "svelte";
+    import { describeFailure } from "$lib/failures";
 
     const clientId = get(ozonKeys).clientId;
     const cacheKey = `ozon-dashboard:${clientId}`;
+
+    /**
+     * The month every money section reports on.
+     *
+     * Declared above the requests rather than with the rest of the period state, because
+     * `useSWR` runs its first request the moment it is created: anything that request reads
+     * has to be initialised already, and reading this one earlier threw a temporal-dead-zone
+     * error the reader saw as raw text.
+     *
+     * The last closed month, not the current one: the current month is a few days old, has
+     * no realization report, and makes every section look as though its data had vanished.
+     */
+    let periodMonth = $state(lastCompleteMonth(new Date()));
+
+    /**
+     * Which month the last request was actually for.
+     *
+     * The SWR key is stable — it has to be, because the hook does not re-run when a key
+     * changes — so without this a failure for one month would be displayed under the label
+     * of another. That is exactly what happened with October's missing report appearing as
+     * a September error. It starts as `null`: before any request there is nothing to
+     * attribute, and an unattributed error stays hidden.
+     *
+     * Declared here for the same reason as the month above: the request assigns to it, and
+     * the request starts the moment its hook is created.
+     */
+    let requestedMonth = $state<string | null>(null);
+
+    /**
+     * The earliest order the page needs: the first day of the month on screen.
+     *
+     * Read inside the request closure rather than passed in, because the SWR key is fixed for
+     * the lifetime of the component — a month change forces a revalidation instead of a new
+     * key.
+     */
+    const dashboardWindowFrom = $derived.by(() => {
+        const firstOfMonth = `${periodMonth}-01`;
+        // The bento's widest window is 31 days back, anchored to today rather than the month.
+        const thirtyOneDaysAgo = dayKey(new Date(Date.now() - 31 * 24 * 60 * 60 * 1000));
+
+        return firstOfMonth < thirtyOneDaysAgo ? firstOfMonth : thirtyOneDaysAgo;
+    });
+
+    /**
+     * The last day of the month on screen, or `undefined` for a month still running.
+     *
+     * Stating both ends is what lets an old month be fetched as one bounded range: the walk
+     * costs the month's own length rather than its distance from today. The endpoint pairs it
+     * with today's tail, so the bento keeps working while a year-old month is on screen.
+     */
+    const dashboardWindowTo = $derived.by(() => {
+        // `null` for an unusable key, which leaves the endpoint to default to today.
+        const monthEnd = monthBounds(periodMonth)?.to;
+        const tomorrow = dayKey(new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+        return monthEnd !== undefined && monthEnd < tomorrow ? monthEnd : undefined;
+    });
 
     const swrResult = useSWR(
         // Account-scoped key. The key itself is fixed for the lifetime of this
@@ -79,18 +153,30 @@
 
             const previous = peekCache<DashboardPayload>(cacheKey);
 
-            // Only the recent tail of the history can still change, so a refresh
-            // asks for that window and folds it into what is already on screen.
-            if (previous && !needsFullLoad(previous)) {
+            // The window has to cover the month on screen, or its first days would be missing
+            // from every order-derived figure. The bento's 31-day windows are anchored to
+            // today, so the window is whichever starts earlier: the selected month or 31 days
+            // back.
+            const windowFrom = dashboardWindowFrom;
+            const windowTo = dashboardWindowTo;
+
+            // Asked of the ranges the payload was fetched with, never of its earliest edge:
+            // see `coversWindow` for the day of September that mistake cost.
+            const neededTo = windowTo ?? dayKey(new Date());
+            const covered = coversWindow(previous, windowFrom, neededTo);
+
+            if (previous && covered && !needsFullLoad(previous)) {
+                // Only the recent tail of the history can still change, so a refresh asks for
+                // that window and folds it into what is already on screen.
                 return mergeDashboardPayload(
                     previous,
-                    await getDashboardData(signal, refreshSince()),
+                    await getDashboardData(signal, refreshSince(), windowFrom, windowTo),
                 );
             }
 
             // The endpoint walks Ozon's cursors server-side and returns only the
             // fields the table renders, so the browser makes a single request.
-            return getDashboardData(signal);
+            return getDashboardData(signal, windowFrom, windowFrom, windowTo);
         },
         // The 31-day figures change slowly, so a minute was far too eager.
         { dedupingInterval: 2000, refreshInterval: 5 * 60 * 1000 },
@@ -138,14 +224,62 @@
     // ask only for the two trailing days instead of walking all 31 again.
     const FINANCE_WINDOW_DAYS = 31;
 
-    // Order-derived state first: the money and margin blocks below both build on it.
+    // Order-derived state first: everything below builds on it.
     const postingsData = $derived($dashboardData?.postings ?? []);
     // Cancelled orders earn nothing, so every money figure leaves them out.
     const paidPostings = $derived(
         postingsData.filter((posting) => posting.status !== "cancelled"),
     );
-    const error = $derived($swrError?.message ?? null);
-    const accrualWindow = $derived(accrualWindowDays(new Date(), FINANCE_WINDOW_DAYS));
+    const error = $derived(describeFailure($swrError));
+
+    // --- The selected month ---
+    //
+    // Every money section follows this one control, so the figures on screen always belong
+    // to a single, named period. It is a calendar month and nothing else: the realization
+    // report and the accrual statements are monthly documents, and a trailing window can
+    // never be reconciled against them.
+    //
+    // `periodMonth` itself is declared at the top, above the requests that read it.
+    const periodDayList = $derived(daysOfMonth(periodMonth));
+    const periodDaySet = $derived(new Set(periodDayList));
+    const periodLabel = $derived(monthLabel(periodMonth));
+    // The month before, so one can be read against the other.
+    const previousMonth = $derived(previousMonthKey(periodMonth));
+    const previousPeriodDayList = $derived(daysOfMonth(previousMonth));
+    const previousLabel = $derived(monthLabel(previousMonth));
+    // Accruals are fetched for both months at once; the endpoint caps the request at 62 days,
+    // which is exactly two months, so the comparison costs nothing extra to keep fresh.
+    const financeFetchDays = $derived(
+        [...new Set([...periodDayList, ...previousPeriodDayList])].sort(),
+    );
+    // Months come from the calendar, not from the loaded orders: the point of the month mode
+    // is to reach periods the order feed cannot cover, and the realization report answers for
+    // any month — December 2025 was verified to return data.
+    const MONTHS_BACK = 24;
+    const availableMonthList = $derived(recentMonths(new Date(), MONTHS_BACK));
+
+    // The dashboard loads a bounded history, so an older month cannot be shown in full.
+    // Saying so matters: otherwise a partial month reads as a collapse in sales.
+    const loadedFromDay = $derived.by(() => {
+        const days = postingsData
+            .map((posting) => new Date(posting.created_at))
+            .filter((date) => !Number.isNaN(date.getTime()))
+            .map((date) => dayKey(date))
+            .sort();
+
+        return days[0] ?? null;
+    });
+    const periodIsPartial = $derived(
+        loadedFromDay !== null &&
+            periodDayList.length > 0 &&
+            periodDayList[0] < loadedFromDay,
+    );
+    /** True when the loaded order history does not reach the selected period at all. */
+    const periodHasNoOrders = $derived(
+        periodIsPartial &&
+            postingsData.length > 0 &&
+            !postingsData.some((posting) => isInsidePeriod(posting.created_at, periodDaySet)),
+    );
 
     function accrualStorageKey() {
         return `ozon_accruals:${clientId}`;
@@ -190,7 +324,9 @@
             }
 
             const cache = readAccrualCache();
-            const window = accrualWindowDays(new Date(), FINANCE_WINDOW_DAYS);
+            // The selected month decides which days are needed, so choosing an earlier month
+            // fetches that month and leaves the others cached.
+            const window = financeFetchDays;
             const missing = daysToFetch(cache, window);
             const needsTypes = Object.keys(cache.types).length === 0;
 
@@ -199,7 +335,9 @@
             const payload = await getEconomicsData(signal, missing, needsTypes);
             const merged = pruneAccrualCache(
                 mergeAccrualDays(cache, payload.days, payload.types, payload.fetchedAt),
-                window,
+                // The selected month and the one before it: the comparison needs both, and
+                // dropping either would cost a fresh round of requests on every switch.
+                financeFetchDays,
             );
             writeAccrualCache(merged);
 
@@ -219,14 +357,84 @@
         dispose: disposeFinance,
     } = economicsResult;
 
+    // --- The selected month, straight from Ozon's monthly documents ---
+    //
+    // The order feed is bounded, so it can never answer for March. The realization report
+    // is monthly and the API serves it for any month, which is what makes older months
+    // reachable at all.
+    const monthFinanceResult = useSWR(
+        `ozon-month-finance:${clientId}`,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
+            }
+
+            // Recorded before the fetch so a failure can be attributed to the month it was
+            // asked for. Ozon answers 404 for a month it has not closed yet — its report
+            // appears only afterwards — and that is reported as a state, not an error.
+            requestedMonth = periodMonth;
+
+            return getMonthFinance(signal, periodMonth);
+        },
+        { dedupingInterval: 5000 },
+    );
+
+    const {
+        data: monthFinanceData,
+        error: monthFinanceError,
+        isLoading: monthFinanceLoading,
+        isValidating: monthFinanceValidating,
+        mutate: mutateMonthFinance,
+        dispose: disposeMonthFinance,
+    } = monthFinanceResult;
+
+    // Switching the month changes which days the accruals must cover; the SWR closures are
+    // not reactive, so the refetch is asked for explicitly.
+    let lastRequestedPeriod = $state("");
+    $effect(() => {
+        const key = periodMonth;
+        if (lastRequestedPeriod === "") {
+            lastRequestedPeriod = key;
+            return;
+        }
+        if (lastRequestedPeriod === key) return;
+
+        lastRequestedPeriod = key;
+        void mutateFinance({ force: true });
+        // The monthly block follows the same control, so it reloads with it.
+        void mutateMonthFinance({ force: true });
+        // Orders too: the window that covers the month changes with it, and the fetch decides
+        // whether that means the recent tail again or the whole window.
+        void mutate({ force: true });
+    });
+
     const accrualDays = $derived(
-        $financeData ? cachedWindow($financeData, accrualWindow) : [],
+        $financeData ? cachedWindow($financeData, periodDayList) : [],
     );
     const finance = $derived(
         summariseFinance(accrualDays, $financeData?.types ?? {}),
     );
-    const financeGroups = $derived(groupTotals(finance.orderLines));
-    const financeLoadError = $derived($financeError?.message ?? null);
+    const financeLoadError = $derived(describeFailure($financeError));
+
+    // The same figures for the window before, so a month reads against its predecessor.
+    const previousAccrualDays = $derived(
+        $financeData ? cachedWindow($financeData, previousPeriodDayList) : [],
+    );
+    const previousFinance = $derived(
+        summariseFinance(previousAccrualDays, $financeData?.types ?? {}),
+    );
+    // A delta is only meaningful when the whole previous window is on hand. Part of it would
+    // compare a month against a fragment and call the difference growth.
+    const previousComplete = $derived(
+        previousPeriodDayList.length > 0 &&
+            previousAccrualDays.length === previousPeriodDayList.length,
+    );    const financeDeltaPct = $derived(
+        previousComplete && previousFinance.net !== 0
+            ? ((finance.net - previousFinance.net) / Math.abs(previousFinance.net)) * 100
+            : null,
+    );
 
     // Delivered orders Ozon has not accrued for yet: normal for a day or two, a payout
     // delay or a broken feed beyond that.
@@ -255,17 +463,16 @@
         resetDashboard();
         resetStocks();
         resetFinance();
-        resetTurnover();
         mutate({ force: true });
         mutateStocks({ force: true });
         mutateFinance({ force: true });
-        mutateTurnover({ force: true });
     });
 
     // Clean up resources when component is destroyed
     onDestroy(dispose);
     onDestroy(disposeStocks);
     onDestroy(disposeFinance);
+    onDestroy(disposeMonthFinance);
 
     const isUp = (value: number | null) => value !== null && value >= 0;
     const isDown = (value: number | null) => value !== null && value < 0;
@@ -276,9 +483,6 @@
     function formatTime(date: Date) {
         return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
     }
-
-    /** Short label for a posting status, falling back to the raw value. */
-    const statusLabel = (status: string) => STATUS_LABELS[status] ?? status;
 
     /** Colors for the three window series (7 / 14 / 31 days). */
     const SERIES_COLORS = ["#6366f1", "#a855f7", "#eab308"];
@@ -299,37 +503,57 @@
     // Recomputed whenever the postings change.
     const stats = $derived(calculateStats(postingsData));
 
-    // Shared analysis window for the trend and the hourly chart (7 / 14 / 31 days).
-    // The dashboard loads 31 days of history, so that is the default.
-    let windowDays = $state(31);
+    // The two charts follow the same month as the money sections, so one page has one period
+    // and one definition of it.
+    const analysisWindow = $derived.by(() => {
+        const [year, month] = periodMonth.split("-").map(Number);
+        // Day 0 of the following month is the last day of this one.
+        const lastDay = new Date(year, month, 0).getDate();
+
+        return {
+            end: new Date(year, month - 1, lastDay, 23, 59, 59),
+            days: lastDay,
+        };
+    });
+
+    // --- The month on screen, as opposed to the whole payload ---
+    //
+    // Declared here because the breakdowns below are scoped to it. Cancelled orders earn
+    // nothing, so they are out of every money figure.
+    const moneyWindow = $derived(
+        paidPostings.filter((posting) => isInsidePeriod(posting.created_at, periodDaySet)),
+    );
 
     // --- Tier 2: breakdowns derived from the postings already in memory ---
-    const trend = $derived(dailyTrend(postingsData, windowDays));
+    //
+    // These aggregate whatever they are handed, so they are handed the month on screen and
+    // not the whole payload. The payload can hold two disjoint ranges — an old month beside
+    // today's tail, which is how a month a year back is fetched without walking the year in
+    // between — and an aggregation across both would mix orders a twelvemonth apart.
+    const trend = $derived(
+        dailyTrend(postingsData, analysisWindow.days, analysisWindow.end),
+    );
     const trendMax = $derived(Math.max(1, ...trend.map((point) => point.netRevenue)));
 
-    const top = $derived(topProducts(postingsData, 8));
-    const concentration = $derived(revenueConcentration(postingsData));
-    const cities = $derived(byCity(postingsData, 6));
-    const payments = $derived(byPaymentType(postingsData, 5));
-    const routes = $derived(clusterRoutes(postingsData, 6));
-    const actionStats = $derived(actionBreakdown(postingsData, 6));
-    const promo = $derived(promoShare(postingsData));
+    const top = $derived(topProducts(moneyWindow, 8));
+    const concentration = $derived(revenueConcentration(moneyWindow));
+    const cities = $derived(byCity(moneyWindow, 6));
+    const payments = $derived(byPaymentType(moneyWindow, 5));
+    const routes = $derived(clusterRoutes(moneyWindow, 6));
+    const actionStats = $derived(actionBreakdown(moneyWindow, 6));
+    const promo = $derived(promoShare(moneyWindow));
     const deltas = $derived(compareWindows(postingsData));
 
     // Orders by local hour: answers "at what time do customers buy".
-    const hours = $derived(hourlyActivity(postingsData, windowDays));
+    const hours = $derived(
+        hourlyActivity(postingsData, analysisWindow.days, analysisWindow.end),
+    );
     const hoursMax = $derived(Math.max(1, ...hours.map((point) => point.orders)));
     const peakHour = $derived(
         hours.reduce(
             (best, point) => (point.orders > best.orders ? point : best),
             hours[0],
         ),
-    );
-
-    // Posting counts per status for the three nested windows.
-    const statuses = $derived(statusBreakdown(postingsData, [7, 14, 31]));
-    const statusMax = $derived(
-        Math.max(1, ...statuses.rows.flatMap((row) => row.counts), ...statuses.totals),
     );
 
     const monthStats = $derived(stats.calendarMonth);
@@ -363,27 +587,216 @@
             : inventoryInsights([], []),
     );
 
-    // --- Money, as opposed to revenue ---
-    //
-    // Ozon reports `payout` and `commission_amount` inside `financial_data` of the
-    // same free endpoint the orders come from, so unit economics needs no paid
-    // method. Cancelled orders were already filtered out above.
-    const MONEY_WINDOW_DAYS = 31;
-    const moneyWindow = $derived.by(() => {
-        const since = Date.now() - MONEY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-        return paidPostings.filter((posting) => {
-            const createdAt = new Date(posting.created_at).getTime();
-            return Number.isFinite(createdAt) && createdAt >= since;
-        });
-    });
-    const money = $derived(moneySummary(moneyWindow));
-
     // --- Margin, which needs a cost price the API cannot supply ---
+    //
+    // Ozon reports `payout` and `commission` inside `financial_data` of the same free
+    // endpoint the orders come from, so unit economics needs no paid method.
     //
     // Costs are resolved per order date, so a margin for an old period uses the price
     // that applied then instead of today's.
     const costs = $derived(costBookLookup($costBook));
     const skuRows = $derived(skuEconomics(moneyWindow, costs));
+
+    /**
+     * Ozon's commission rate per article, and the spread across them.
+     *
+     * The account-wide rate is a blend, not a rate: in September it read 51 % while articles
+     * ran from 17 % to 52 %, the blend being pulled up by two high-revenue suitcases. A
+     * seller prices per article, so the per-article figure is the one that answers anything.
+     */
+    const commission = $derived(commissionSpread(moneyWindow));
+
+    /**
+     * Money that may be unknown.
+     *
+     * A null balance field is not zero: it means the method did not report it. Rendering
+     * `0 ₽` there would invent a figure, so it renders a dash.
+     */
+    const moneyOrDash = (value: number | null | undefined): string =>
+        value === null || value === undefined ? "—" : formatCurrency(value);
+
+    // --- The month's realization, cost of goods, tax and what is left ---
+    //
+    // Both the data and the failure are attributed to the month they belong to by a tested
+    // helper, so a stale answer can never appear under a newly selected month.
+    const monthViewResult = $derived(
+        monthView(
+            periodMonth,
+            requestedMonth,
+            $monthFinanceData,
+            $monthFinanceError as { status?: number; message?: string } | null,
+        ),
+    );
+    const monthFinance = $derived(monthViewResult.data);
+    const monthError = $derived(
+        monthViewResult.error === null
+            ? null
+            : { ...monthViewResult.error, message: describeFailure(monthViewResult.error) },
+    );
+    // Ozon publishes the monthly report after the month closes, so the current month has
+    // none. That is a state to explain, not an error to report.
+    const monthReportMissing = $derived(monthViewResult.reportMissing);
+
+    const monthRealization = $derived(monthFinance?.realization ?? null);
+    const monthBalance = $derived(monthFinance?.balance ?? null);
+    const monthCashflows = $derived(monthFinance?.cashflows ?? null);
+    const monthPartialError = $derived(monthFinance?.partialError ?? null);
+
+    /**
+     * Cost of the goods sold in the selected month.
+     *
+     * Taken from the dated cost book at the end of that month, so an old month uses the
+     * price that applied then. Units are net of returns, because a returned item comes back
+     * into stock rather than being sold. Coverage is reported rather than assumed: a net
+     * figure built on a partly known cost would be a guess wearing a precise number.
+     */
+    const monthCost = $derived.by(() => {
+        const realization = monthRealization;
+        if (!realization) return { cost: null as number | null, covered: 0, units: 0, complete: false };
+
+        const bounds = monthBounds(periodMonth);
+        const at = bounds ? new Date(`${bounds.to}T23:59:59`) : new Date();
+
+        let cost = 0;
+        let covered = 0;
+        let units = 0;
+
+        for (const line of realization.perSku) {
+            const sold = Math.max(0, line.units - line.returnedUnits);
+            if (sold === 0) continue;
+
+            units += sold;
+            const unitCost = costs(line.offerId, line.sku, at);
+            if (unitCost === undefined) continue;
+
+            cost += sold * unitCost;
+            covered += sold;
+        }
+
+        return { cost, covered, units, complete: units > 0 && covered === units };
+    });
+
+    /**
+     * What is left after tax and the cost of goods.
+     *
+     * The income and the taxable base are not always the same thing, which is why both are
+     * named: under a `доходы` regime the rate is charged on money received, under a profit
+     * regime on the margin. All three settings reduce to the tested calculation.
+     */
+    /**
+     * What Ozon pays for each settlement period.
+     *
+     * A payout is the sum of the accruals dated inside its period — checked to the kopeck
+     * against the cabinet's own payout report on every September period it covered:
+     * 01–06.09 gives 26 729.31, 07–13.09 gives 33 367.38, and so on. The composition table
+     * below is a different reading (the balance report's), which is why its total never
+     * equalled the payout; this is the number the seller actually receives.
+     */
+    const payoutPeriodRows = $derived.by(() => {
+        const periods = payoutPeriods(periodMonth).map((period) => ({
+            ...period,
+            payout: 0,
+            days: 0,
+        }));
+
+        for (const day of accrualDays) {
+            const index = periods.findIndex(
+                (period) => day.date >= period.from && day.date <= period.to,
+            );
+            if (index === -1) continue;
+
+            periods[index].payout += day.net;
+            periods[index].days += 1;
+        }
+
+        return periods;
+    });
+
+    /** Days a period should contain, inclusive. */
+    const daysInPeriod = (from: string, to: string): number =>
+        Math.round(
+            (new Date(`${to}T00:00:00`).getTime() - new Date(`${from}T00:00:00`).getTime()) /
+                86400000,
+        ) + 1;
+
+    /** Payout for the period a week row belongs to, or `null` when the accruals do not cover it. */
+    const payoutFor = (from: string): number | null => {
+        const match = payoutPeriodRows.find((period) => period.from === from);
+        // A period the accruals do not fully cover is not reported: a partial sum would read
+        // as a short payout rather than as missing data.
+        if (!match || match.days !== daysInPeriod(match.from, match.to)) return null;
+
+        return match.payout;
+    };
+
+    /** True when every settlement period of the month is covered by loaded accruals. */
+    const payoutCoverageComplete = $derived(
+        payoutPeriodRows.length > 0 &&
+            payoutPeriodRows.every(
+                (period) => period.days === daysInPeriod(period.from, period.to),
+            ),
+    );
+
+    /**
+     * The settlement periods added up, and whether that equals what was accrued.
+     *
+     * It must: a payout is the accruals of its period, so the periods of a month are simply
+     * that month's accruals cut into weeks. Showing the sum turns the claim into something
+     * the reader can check on screen: the periods of any settled month add up to that month's
+     * accrued total, to the kopeck.
+     */
+    const payoutPeriodsTotal = $derived.by(() => {
+        const weeks = monthFinance?.weeks ?? [];
+        let total = 0;
+        let covered = 0;
+
+        for (const week of weeks) {
+            const value = payoutFor(week.from);
+            if (value === null) continue;
+            total += value;
+            covered += 1;
+        }
+
+        const accrued = monthBalance?.accrued ?? null;
+
+        return {
+            total,
+            covered,
+            expected: weeks.length,
+            complete: weeks.length > 0 && covered === weeks.length,
+            accrued,
+            matchesAccrued:
+                accrued !== null && covered === weeks.length && Math.abs(total - accrued) < 0.02,
+        };
+    });
+
+    /** What is left after tax and the cost of goods for the month. */
+    const monthProfit = $derived.by(() => {
+        const settings = $taxSettings;
+        // The first step of the chain is always the money Ozon sends. The tax may be charged
+        // on something larger — the realized revenue — which is why the two are separate.
+        const payout = monthBalance?.accrued ?? 0;
+        // Realized minus returns, which is the figure the seller declares: Ozon's «Реализовано»
+        // is what buyers paid, and what came back to them is not income.
+        const realized = monthRealization?.net ?? 0;
+        const cost = monthCost.complete ? monthCost.cost : null;
+
+        const taxable = taxableAmount(settings.base, { payout, realized, cost });
+        const result = profitAfterTaxAndCost({
+            payout,
+            taxable,
+            taxPercent: settings.percent,
+            cost,
+        });
+
+        return {
+            ...result,
+            base: settings.base,
+            /** False when the cost book cannot cover the month, so no net is shown. */
+            costKnown: monthCost.complete,
+            realized
+        };
+    });
 
     const marginTotals = $derived.by(() => {
         // Only rows where every unit has both a payout and a cost carry a profit figure.
@@ -439,90 +852,43 @@
 
     let showCogs = $state(false);
 
-    // --- Ozon's own turnover report ---
-    //
-    // Limited upstream to one request per minute, so the answer is cached and asked for
-    // rarely. This is an enrichment: without it the dashboard still knows days of cover
-    // from its own postings-versus-stock estimate.
-    const TURNOVER_MIN_AGE_MS = 15 * 60 * 1000;
+    /**
+     * How far down the page the reader is, and whether the way back is worth offering.
+     *
+     * One passive listener for both: the ring is this number, so a second listener for the
+     * button's visibility would measure the same thing twice. The handler is not throttled
+     * because it only assigns state — the browser coalesces the paint, and a rAF wrapper
+     * would add a frame of lag to a control that should feel immediate.
+     */
+    let scrollProgress = $state(0);
+    let showToTop = $state(false);
 
-    function turnoverStorageKey() {
-        return `ozon_turnover:${clientId}`;
-    }
+    $effect(() => {
+        const onScroll = () => {
+            const scrolled = window.scrollY;
+            const scrollable = document.documentElement.scrollHeight - window.innerHeight;
 
-    function readTurnoverCache(): TurnoverPayload | null {
-        try {
-            const raw = localStorage.getItem(turnoverStorageKey());
-            if (!raw) return null;
+            scrollProgress = scrollable > 0 ? Math.min(1, Math.max(0, scrolled / scrollable)) : 0;
+            showToTop = scrolled > 600;
+        };
 
-            const parsed = JSON.parse(raw) as TurnoverPayload;
-            if (!parsed || !Array.isArray(parsed.rows) || typeof parsed.fetchedAt !== "string") {
-                return null;
-            }
+        onScroll();
+        window.addEventListener("scroll", onScroll, { passive: true });
+        window.addEventListener("resize", onScroll);
 
-            // A cached failure is not worth keeping: it would block a retry for minutes.
-            if (parsed.error) return null;
-
-            return parsed;
-        } catch {
-            return null;
-        }
-    }
-
-    function writeTurnoverCache(payload: TurnoverPayload) {
-        if (payload.error) return;
-        try {
-            localStorage.setItem(turnoverStorageKey(), JSON.stringify(payload));
-        } catch {
-            // Ignore quota.
-        }
-    }
-
-    const turnoverResult = useSWR(
-        `ozon-turnover:${clientId}`,
-        async (signal) => {
-            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
-                throw new Error(
-                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
-                );
-            }
-
-            const cached = readTurnoverCache();
-            if (cached) {
-                const age = Date.now() - Date.parse(cached.fetchedAt);
-                if (Number.isFinite(age) && age < TURNOVER_MIN_AGE_MS) return cached;
-            }
-
-            const payload = await getTurnoverData(signal);
-            writeTurnoverCache(payload);
-            return payload;
-        },
-        { dedupingInterval: 2000, refreshInterval: 60 * 60 * 1000 },
-    );
-
-    const {
-        data: turnoverData,
-        reset: resetTurnover,
-        mutate: mutateTurnover,
-        dispose: disposeTurnover,
-    } = turnoverResult;
-
-    onDestroy(disposeTurnover);
-
-    const turnover = $derived(summariseTurnover($turnoverData?.rows ?? []));
-
-    // Ozon reports turnover by SKU; the names come from the inventory rows.
-    const turnoverDeficit = $derived.by(() => {
-        const nameBySku = new Map(inventory.rows.map((row) => [row.sku, row.name]));
-
-        return turnover.deficit.slice(0, 8).map((row) => ({
-            sku: row.sku,
-            name: nameBySku.get(row.sku) ?? `SKU ${row.sku}`,
-            idc: row.idc,
-            grade: gradeLabel(row.grade),
-            cluster: gradeLabel(row.gradeCluster)
-        }));
+        return () => {
+            window.removeEventListener("scroll", onScroll);
+            window.removeEventListener("resize", onScroll);
+        };
     });
+
+    /** Honours a reduced-motion preference: a long smooth scroll is exactly the motion it asks to avoid. */
+    function scrollToTop() {
+        const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        window.scrollTo({ top: 0, behavior: reduce ? "auto" : "smooth" });
+    }
+
+
 
     // --- Capital and priorities ---
     const capital = $derived(
@@ -530,80 +896,57 @@
             inventory,
             economics: skuRows,
             unitCost: (offerId, sku) => costs(offerId, sku, new Date()),
-            periodDays: MONEY_WINDOW_DAYS
+            // Turnover and GMROI divide by the period the figures cover, so the selected
+            // period has to reach them too.
+            periodDays: periodDayList.length
         })
     );
 
-    const actions = $derived(
-        buildActions({
-            capital,
-            economics: skuRows,
-            finance,
-            costedShare: capital.costedShare,
-            soldCostCoverage:
-                marginTotals.units > 0 ? marginTotals.costedUnits / marginTotals.units : 0,
-            now: new Date()
-        })
-    );
 
-    const ACTION_SEVERITY_LABELS: Record<string, string> = {
-        high: "Срочно",
-        medium: "Важно",
-        low: "К сведению"
-    };
 
-    const ACTION_BASIS_LABELS: Record<string, string> = {
-        day: "в день",
-        period: "за период",
-        once: "заморожено",
-        none: ""
-    };
-
-    /** Restocking suggestion for the items running out, most urgent first. */
-    const RESTOCK_COVER_DAYS = 30;
-    const replenishment = $derived(
-        capital.rows
-            .filter(
-                (row) =>
-                    row.demandPerDay > 0 &&
-                    (row.health === "out" ||
-                        row.health === "critical" ||
-                        row.health === "low"),
-            )
-            .map((row) => {
-                const unitCost =
-                    row.stockUnits > 0 && row.stockAtCost !== null
-                        ? row.stockAtCost / row.stockUnits
-                        : null;
-                const units = suggestedOrder(
-                    row.demandPerDay,
-                    row.stockUnits,
-                    RESTOCK_COVER_DAYS,
-                );
-
-                return {
-                    key: row.key,
-                    name: row.name,
-                    stockUnits: row.stockUnits,
-                    units,
-                    /** What the order costs, when a cost price is known. */
-                    money: unitCost === null ? null : units * unitCost
-                };
-            })
-            .filter((row) => row.units > 0)
-            .sort((a, b) => (b.money ?? 0) - (a.money ?? 0) || b.units - a.units)
-            .slice(0, 6)
-    );
-
-    // Products offered in the cost panel: everything that sold in the window.
+    /**
+     * Products offered in the cost panel: the window's own, plus the month's.
+     *
+     * The loaded window is not enough on its own. Ozon's monthly realization report can
+     * contain articles that sold outside that window — a product sold on 1 September is
+     * already gone from a 31-day feed read in October — and if the panel cannot offer them,
+     * their cost can never be entered, the month's coverage stays short of every unit, and
+     * the net figure is withheld forever with no way to fix it. That is exactly what
+     * happened: 8 units of 370 had nowhere to be priced.
+     */
     const costCandidates = $derived(
-        skuRows.map((row) => ({
-            key: row.key,
-            label: row.name,
-            units: row.units,
-            payout: row.payout
-        })),
+        mergeCostCandidates(
+            skuRows.map((row) => ({
+                key: row.key,
+                label: row.name,
+                units: row.units,
+                payout: row.payout,
+            })),
+            monthRealization?.perSku ?? [],
+            costKey,
+        ),
     );
+
+    /** How many products the cost book knows about, regardless of the selected period. */
+    const costBookSize = $derived(Object.keys($costBook).length);
+
+    /** Month products whose sale has no cost price, so the reader knows what to fill in. */
+    const monthMissingCosts = $derived.by(() => {
+        const realization = monthRealization;
+        if (!realization) return [];
+
+        const bounds = monthBounds(periodMonth);
+        const at = bounds ? new Date(`${bounds.to}T23:59:59`) : new Date();
+
+        return realization.perSku
+            .map((line) => ({
+                label: line.name || line.offerId || String(line.sku),
+                sold: Math.max(0, line.units - line.returnedUnits),
+                known: costs(line.offerId, line.sku, at) !== undefined,
+            }))
+            .filter((line) => line.sold > 0 && !line.known)
+            .sort((a, b) => b.sold - a.sold);
+    });
 
     // Dynamic title for the browser tab, showing today's net sales once there are any.
     const pageTitle = $derived(
@@ -768,70 +1111,13 @@
             </p>
         </div>
     {:else}
-    <section class="insights-section" aria-label="Что требует действия">
-        <div class="bento-header">
-            <h2 class="section-title">Требует действия</h2>
-            <InfoTip
-                text="Сводка того, что стоит сделать, с суммой на кону. У каждой строки указана своя база: «в день» — теряется ежедневно, «за период» — уже потеряно за 31 день, «заморожено» — деньги, вложенные в товар и не возвращающиеся продажами. Складывать эти числа между собой нельзя."
-                label="Пояснение к списку действий"
-            />
-        </div>
 
-        {#if showSkeletons}
-            <div class="action-list" aria-hidden="true">
-                {#each [1, 2, 3] as card (card)}
-                    <div class="action-card">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            </div>
-        {:else if actions.length === 0}
-            <div class="panel glass-panel state-note">
-                <p>Срочного нет: дефицита нет, убыточных товаров нет, начисления свежие.</p>
-            </div>
-        {:else}
-            <div class="action-list">
-                {#each actions as action (action.kind)}
-                    <div class="action-card" data-severity={action.severity}>
-                        <div class="action-main">
-                            <span class="action-head">
-                                <span class="action-severity" data-severity={action.severity}
-                                    >{ACTION_SEVERITY_LABELS[action.severity]}</span
-                                >
-                                <span class="action-title">{action.title}</span>
-                            </span>
-                            <span class="action-detail">{action.detail}</span>
-                            {#if action.skus.length > 0}
-                                <span class="action-skus">
-                                    {action.skus.map((item) => item.name).join(" · ")}{action
-                                        .skus.length >= 5
-                                        ? " и другие"
-                                        : ""}
-                                </span>
-                            {/if}
-                        </div>
-                        {#if action.amount !== null}
-                            <div class="action-amount">
-                                <span class="action-value"
-                                    >{formatCurrency(action.amount)}</span
-                                >
-                                <span class="action-basis"
-                                    >{ACTION_BASIS_LABELS[action.basis]}</span
-                                >
-                            </div>
-                        {/if}
-                    </div>
-                {/each}
-            </div>
-        {/if}
-    </section>
     <section class="stats-section" aria-busy={showSkeletons}>
         <div class="bento-header">
-            <h2 class="section-title">Performance Analytics</h2>
+            <h2 class="section-title">Сейчас · выручка по шести периодам</h2>
             <InfoTip
-                text="Шесть окон сразу: календарные (с 00:00 сегодня, с понедельника, с 1-го числа) и скользящие (последние 24 часа / 7 / 31 день от текущего момента). Большое число в каждой карточке — выручка без отменённых заказов, строка Gross — до вычетов."
-                label="Пояснение к периодам"
+                text="Фиксированный обзор: три календарных окна (с 00:00 сегодня, с понедельника, с 1-го числа) и три скользящих (последние 24 часа, 7 и 31 день от текущего момента). Этот блок не подчиняется переключателю периода вверху — он всегда показывает все шесть окон сразу, чтобы видеть масштаб. Большое число в карточке — цена продавца без отменённых заказов, то есть деньги покупателя; строка Gross — до вычетов. Сколько из этих денег остаётся вам, считают разделы «Деньги» и «Начисления»."
+                label="Пояснение к периодам выручки"
             />
             <span class="updated-at" role="status" aria-live="polite">
                 {#if showSkeletons}
@@ -870,7 +1156,7 @@
             <div class="bento-card hero-card glass-panel glow-effect">
                 <div class="card-content">
                     <div class="card-header">
-                        <span class="bento-label">Calendar Day</span>
+                        <span class="bento-label">Календарный день</span>
                         <span
                             class="live-indicator"
                             class:busy={$isValidating}
@@ -886,7 +1172,7 @@
                         <!-- This is the seller's price, i.e. what the buyer pays. It is
                              not what reaches the account; the money block below says
                              how much Ozon keeps. -->
-                        <div class="main-label">Выручка продавца · без отмен</div>
+                        <div>Выручка продавца · без отмен</div>
                     </div>
                     <div class="card-sub-stats">
                         <div class="sub-stat">
@@ -922,7 +1208,7 @@
             <!-- Medium Card: Calendar Week -->
             <div class="bento-card medium-card glass-panel">
                 <div class="card-content">
-                    <span class="bento-label">Calendar Week</span>
+                    <span class="bento-label">Календарная неделя</span>
                     <div class="card-value-group">
                         <!-- Main: Net Sales -->
                         <span class="diamond-text text-lg"
@@ -930,22 +1216,22 @@
                         >
                         <span class="unit">₽</span>
                     </div>
-                    <div class="mini-stat-col">
+                    <div>
                         <div class="mini-row">
-                            <span class="mini-label">Orders:</span>
+                            <span>Заказы:</span>
                             <span class="mini-value"
                                 >{stats.calendarWeek.count}</span
                             >
                         </div>
                         <div class="mini-row">
-                            <span class="mini-label">Gross (с отменами):</span>
+                            <span>Gross (с отменами):</span>
                             <span class="mini-value"
                                 >{formatCurrency(stats.calendarWeek.sum)}</span
                             >
                         </div>
                         {#if stats.calendarWeek.cancelled > 0}
                             <div class="mini-row">
-                                <span class="mini-label text-error"
+                                <span class="text-error"
                                     >Cancelled:</span
                                 >
                                 <span class="mini-value text-error">
@@ -962,29 +1248,29 @@
             <!-- Medium Card: Calendar Month -->
             <div class="bento-card medium-card glass-panel">
                 <div class="card-content">
-                    <span class="bento-label">Calendar Month</span>
+                    <span class="bento-label">Календарный месяц</span>
                     <div class="card-value-group">
                         <span class="diamond-text text-lg"
                             >{formatCurrencyParts(stats.calendarMonth.netSum).amount}</span
                         >
                         <span class="unit">₽</span>
                     </div>
-                    <div class="mini-stat-col">
+                    <div>
                         <div class="mini-row">
-                            <span class="mini-label">Orders:</span>
+                            <span>Заказы:</span>
                             <span class="mini-value"
                                 >{stats.calendarMonth.count}</span
                             >
                         </div>
                         <div class="mini-row">
-                            <span class="mini-label">Gross (с отменами):</span>
+                            <span>Gross (с отменами):</span>
                             <span class="mini-value"
                                 >{formatCurrency(stats.calendarMonth.sum)}</span
                             >
                         </div>
                         {#if stats.calendarMonth.cancelled > 0}
                             <div class="mini-row">
-                                <span class="mini-label text-error"
+                                <span class="text-error"
                                     >Cancelled:</span
                                 >
                                 <span class="mini-value text-error">
@@ -1000,7 +1286,7 @@
 
             <!-- Small Cards (Optimized for space) -->
             <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Last 24 Hours</span>
+                <span class="bento-label small">Последние 24 часа</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
                         >{formatCurrencyParts(stats.last24h.netSum).amount}</span
@@ -1023,7 +1309,7 @@
             </div>
 
             <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Last 7 Days</span>
+                <span class="bento-label small">Последние 7 дней</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
                         >{formatCurrencyParts(stats.last7d.netSum).amount}</span
@@ -1046,7 +1332,7 @@
             </div>
 
             <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Last 31 Days</span>
+                <span class="bento-label small">Последние 31 день</span>
                 <div class="small-value">
                     <span class="diamond-text text-md"
                         >{formatCurrencyParts(stats.last31d.netSum).amount}</span
@@ -1073,259 +1359,547 @@
 
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Деньги · последние 31 день</h2>
+            <h2 class="section-title">Сейчас · ключевые показатели</h2>
             <InfoTip
-                text="Что из выручки забирает Ozon и что остаётся продавцу. Комиссия и её фактическая ставка — из финансовых данных заказа, это точные суммы. «Остаётся продавцу» — payout из карточки заказа (цена минус комиссия); логистика, обработка отправления и эквайринг в него могут не входить, поэтому это ещё не сумма к выплате на счёт. Точное «к перечислению» появится, когда подключим финансовый слой Ozon. Отменённые заказы не учитываются."
-                label="Пояснение к деньгам"
+                text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Два последних чипа — скользящие окна 24 часа и 7 дней (не календарные) и тоже без отмен, чтобы сравнивать с главным числом дашборда."
+                label="Пояснение к ключевым показателям"
             />
         </div>
         <div class="kpi-strip">
             {#if showSkeletons}
-                {#each [1, 2, 3, 4, 5, 6] as chip (chip)}
+                {#each [1, 2, 3, 4, 5, 6, 7, 8] as chip (chip)}
                     <div class="kpi-chip glass-panel">
                         <span class="skeleton sk-line"></span>
                         <span class="skeleton sk-chip"></span>
                     </div>
                 {/each}
             {:else}
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Выручка продавца</span>
-                    <span class="kpi-value">{formatCurrency(money.gross)}</span>
-                    <span class="kpi-delta">цена покупателя, без отмен</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Комиссия Ozon</span>
-                    <span class="kpi-value">{formatCurrency(money.commission)}</span>
-                    <span class="kpi-delta"
-                        >факт. ставка
-                        {money.commissionRate === null
-                            ? "—"
-                            : formatPercent(money.commissionRate * 100)}</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Остаётся продавцу</span>
-                    <span class="kpi-value">{formatCurrency(money.payout)}</span>
-                    <span class="kpi-delta"
-                        >{money.payoutRatio === null
-                            ? "—"
-                            : formatPercent(money.payoutRatio * 100)} от выручки</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Отдано скидками</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(money.discountValue)}</span
-                    >
-                    <span class="kpi-delta">относительно старой цены</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Продано штук</span>
-                    <span class="kpi-value">{formatNumber(money.units)}</span>
-                </div>
-                {#if money.complete}
+                {#each derivedMetrics as metric (metric.label)}
                     <div class="kpi-chip glass-panel">
-                        <span class="kpi-label">Финансовые данные</span>
-                        <span class="kpi-value">{money.reportedLines}</span>
-                        <span class="kpi-delta">по всем строкам заказов</span>
+                        <span class="kpi-label">{metric.label}</span>
+                        <span class="kpi-value">{metric.value}</span>
                     </div>
-                {:else}
-                    <div class="kpi-chip glass-panel alert">
-                        <span class="kpi-label">Финансовые данные</span>
-                        <span class="kpi-value"
-                            >{money.reportedLines} из {money.totalLines}</span
-                        >
-                        <span class="kpi-delta"
-                            >Ozon отдал суммы не по всем строкам — доли считаются
-                            только по ним</span
-                        >
-                    </div>
-                {/if}
+                {/each}
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Выручка продавца · 24ч</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(deltas.last24h.netRevenue)}</span
+                    >
+                    <span
+                        class="kpi-delta"
+                        class:positive={isUp(deltas.last24h.netRevenueChangePct)}
+                        class:negative={isDown(deltas.last24h.netRevenueChangePct)}
+                        >{formatDelta(deltas.last24h.netRevenueChangePct)} к
+                        предыдущим 24ч</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Выручка продавца · 7 дней</span>
+                    <span class="kpi-value"
+                        >{formatCurrency(deltas.last7d.netRevenue)}</span
+                    >
+                    <span
+                        class="kpi-delta"
+                        class:positive={isUp(deltas.last7d.netRevenueChangePct)}
+                        class:negative={isDown(deltas.last7d.netRevenueChangePct)}
+                        >{formatDelta(deltas.last7d.netRevenueChangePct)} к
+                        предыдущим 7 дням</span
+                    >
+                </div>
             {/if}
         </div>
     </section>
 
-    <section class="insights-section">
+    <section class="period-bar panel glass-panel" aria-label="Месяц отчёта">
+        <div class="period-text">
+            <span class="period-title">Месяц отчёта</span>
+            <span class="period-note">
+                Влияет на разделы «Деньги», «Маржа и ассортимент» и «Капитал», а также на
+                цепочку «От реализованного до счёта» ниже.
+            </span>
+        </div>
+        <PeriodPicker bind:month={periodMonth} months={availableMonthList} />
+    </section>
+
+    {#if periodIsPartial}
+        <div class="panel glass-panel state-note" role="status">
+            <p>
+                Загружена история заказов только с {loadedFromDay}, поэтому за {periodLabel}
+                {periodHasNoOrders
+                    ? "заказов в загруженном окне нет вовсе — а не «продаж не было»"
+                    : "данные неполные, суммы занижены"}.
+            </p>
+            <p class="muted-note">
+                Месячные документы Ozon при этом полные: раздел «Месяц: что дойдёт и что
+                останется» считает по ним, а не по загруженным заказам. Маржа и ABC ниже
+                строятся по заказам, поэтому за такой период они недоступны.
+            </p>
+            <!--
+                What was asked for against what arrived. The window is derived from the month
+                on screen, so these two lines together say whether the short history is the
+                request's doing or the payload's — the question this notice kept raising
+                without answering.
+            -->
+            <p class="muted-note">
+                Запрошено окно {formatDay(dashboardWindowFrom)}{dashboardWindowTo
+                    ? ` — ${formatDay(dashboardWindowTo)}`
+                    : " — по сегодня"}
+                · первый заказ в данных {formatDay(loadedFromDay)}
+            </p>
+            <!--
+                The window asked for always starts at the first day of the month on screen, so
+                this notice means the payload on screen is older than the request rather than
+                that the month is out of reach. Dropping the cache and asking again is the
+                remedy, so it is offered here instead of being left to the reader to guess.
+            -->
+            <button
+                type="button"
+                class="btn-inline"
+                onclick={() => {
+                    resetDashboard();
+                    void mutate({ force: true });
+                }}
+                disabled={$isValidating}
+            >
+                {$isValidating ? "Загружаем…" : `Загрузить ${periodLabel} полностью`}
+            </button>
+        </div>
+    {/if}
+
+
+    <section class="insights-section" aria-label="Месяц: реализация, налоги и себестоимость">
         <div class="bento-header">
-            <h2 class="section-title">Начисления Ozon · последние 31 день</h2>
+            <h2 class="section-title">Месяц · деньги: от реализации до счёта</h2>
             <InfoTip
-                text="Это то, что Ozon начислил и удержал по каждому отправлению — единственный источник, по которому видно, сколько денег реально дойдёт до счёта. Сумма берётся из total_amount как есть и никогда не пересчитывается из комиссии и услуг: у штрафов, страховки и компенсаций отдельных строк нет. Расходы кабинета (хранение, продвижение, сбор отзывов) показаны отдельно и не размазаны по заказам — иначе цифра по отправлению перестала бы сходиться с кабинетом."
-                label="Пояснение к начислениям"
+                text="Здесь месяц читается по месячным документам Ozon, а не по ленте заказов, поэтому доступны и месяцы старше загруженного окна. «Реализовано» в отчёте Ozon — это НЕ цена продавца, а то, что заплатил покупатель: цена продавца собирается из трёх частей, и проверено на строке отчёта — 642,86 оплатил покупатель + 571,71 доплатил Ozon за свою скидку + 6,43 партнёр = 1221,00, ровно выставленная цена. Поэтому в цепочке ниже «Оплачено покупателями» — только первая из трёх частей, а цена продавца — их сумма. «Возвращено» — сумма возвратов клиентов, «Выплаты по механикам» — то, что доплачивают партнёры по программам лояльности. «Начислено» и «Выплачено» — из отчёта о балансе: первое это сколько Ozon насчитал за период, второе — сколько реально перевёл. Ниже из денег вычитаются налог (по умолчанию от реализованного за вычетом возвратов) и себестоимость — в этом порядке."
+                label="Пояснение к месячному разделу"
             />
-            {#if !$financeLoading && finance.failedDays.length === 0 && finance.lastDayWithData}
-                <span class="freshness" role="status" aria-live="polite">
-                    данные по {finance.lastDayWithData}
-                </span>
-            {/if}
         </div>
 
-        {#if $financeLoading}
-            <div class="kpi-strip" aria-hidden="true">
-                {#each [1, 2, 3, 4] as chip (chip)}
+        {#if $monthFinanceLoading && !monthRealization}
+            <div class="kpi-strip">
+                {#each Array(4) as _, index (index)}
                     <div class="kpi-chip glass-panel">
                         <span class="skeleton sk-line"></span>
                         <span class="skeleton sk-chip"></span>
                     </div>
                 {/each}
             </div>
-            <p class="muted-note">
-                Финансовый слой читается по одному дню за запрос, поэтому первый раз это
-                занимает несколько секунд. Дальше закрытые дни берутся из кэша браузера.
-            </p>
-        {:else if financeLoadError}
+        {:else if monthReportMissing}
+            <div class="panel glass-panel state-note">
+                <p>
+                    Отчёт о реализации за {monthLabel(periodMonth)} ещё не сформирован Ozon.
+                    Он появляется после закрытия месяца, поэтому за текущий месяц его нет —
+                    это не ошибка.
+                </p>
+                <p class="muted-note">
+                    Начисления и деньги за этот месяц при этом доступны ниже: они приходят из
+                    отчёта о балансе и из начислений по дням, а не из отчёта о реализации.
+                </p>
+            </div>
+        {:else if monthError}
             <div class="panel glass-panel state-note" role="alert">
-                <p>Начисления не загрузились: {financeLoadError}</p>
+                <p>Не удалось загрузить {monthLabel(periodMonth)}: {monthError.message}</p>
                 <button
                     type="button"
                     class="btn-inline"
-                    onclick={() => mutateFinance({ force: true })}
-                    disabled={$financeValidating}
+                    onclick={() => mutateMonthFinance({ force: true })}
+                    disabled={$monthFinanceValidating}
                 >
-                    {$financeValidating ? "Обновляем…" : "Повторить"}
+                    {$monthFinanceValidating ? "Обновляем…" : "Повторить"}
                 </button>
             </div>
-        {:else}
+        {:else if monthRealization && monthRealization.rows === 0}
+            <div class="panel glass-panel state-note">
+                <p>
+                    За {monthLabel(periodMonth)} в отчёте о реализации нет строк: продаж не
+                    было, либо отчёт ещё пуст.
+                </p>
+            </div>
+        {:else if monthRealization}
             <div class="kpi-strip">
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">К получению по заказам</span>
-                    <span class="kpi-value">{formatCurrency(finance.netOrders)}</span>
-                    <span class="kpi-delta">{finance.accrualCount} начислений</span>
-                </div>
-                <div class="kpi-chip glass-panel" class:alert={finance.netCabinet < 0}>
-                    <span class="kpi-label">Расходы кабинета</span>
-                    <span class="kpi-value">{formatCurrency(finance.netCabinet)}</span>
-                    <span class="kpi-delta">хранение, продвижение, прочее</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Итого за период</span>
-                    <span class="kpi-value">{formatCurrency(finance.net)}</span>
-                    <span class="kpi-delta">то, что дойдёт до счёта</span>
-                </div>
-                <div class="kpi-chip glass-panel" class:alert={finance.failedDays.length > 0}>
-                    <span class="kpi-label">Дней с данными</span>
-                    <span class="kpi-value">{finance.daysWithData}</span>
+                    <span class="kpi-label">Оплачено покупателями · {monthLabel(periodMonth)}</span>
+                    <span class="kpi-value">{formatCurrency(monthRealization.realized)}</span>
                     <span class="kpi-delta">
-                        {#if finance.failedDays.length > 0}
-                            {finance.failedDays.length} дн. не загрузилось — в итог не вошли
-                        {:else if finance.emptyDays.length > 0}
-                            {finance.emptyDays.length} дн. без начислений
-                        {:else}
-                            все дни периода
-                        {/if}
+                        «Реализовано» в отчёте Ozon: {monthRealization.units} шт · {monthRealization.rows} строк
                     </span>
                 </div>
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Ещё не начислено</span>
-                    <span class="kpi-value"
-                        >{inTransit.expectedPayout === null
-                            ? `${inTransit.orders} заказ.`
-                            : formatCurrency(inTransit.expectedPayout)}</span
-                    >
+                    <span class="kpi-label">Возвращено</span>
+                    <span class="kpi-value">{formatCurrency(monthRealization.returned)}</span>
+                    <span class="kpi-delta">{monthRealization.returnedUnits} шт вернули</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Осталось оплаченным</span>
+                    <span class="kpi-value">{formatCurrency(monthRealization.net)}</span>
                     <span class="kpi-delta">
-                        {#if inTransit.orders === 0}
-                            доставленные заказы все с начислениями
-                        {:else}
-                            {inTransit.orders} доставленных за {inTransit.windowDays} дн.
-                            {#if inTransit.priced < inTransit.orders}
-                                · по {inTransit.orders - inTransit.priced} сумм нет
-                            {/if}
-                        {/if}
+                        за вычетом возвратов; это ещё не выручка продавца, а деньги покупателей
                     </span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Выплаты по механикам</span>
+                    <span class="kpi-value">{formatCurrency(monthRealization.loyaltyNet)}</span>
+                    <span class="kpi-delta">доплаты партнёров за период</span>
                 </div>
             </div>
 
-            {#if finance.failedDays.length > 0}
-                <div class="panel glass-panel state-note" role="alert">
-                    <p>
-                        Часть дней не загрузилась, и в суммы они не подставлены нулём:
+            <div class="panel glass-panel payout-panel">
+                <div class="panel-head">
+                    <span class="panel-title-group">
+                        <h3 class="panel-title">Деньги по отчёту о балансе</h3>
+                        <InfoTip
+                            text="Кошелёк на счёте Ozon. «Остаток на начало» — сколько уже лежало на счёте в первый день месяца, «остаток на конец» — сколько лежит в последний. Связь между четырьмя числами одна: остаток на начало + начислено − выплачено = остаток на конец, и на проверенном месяце это сходится до копейки. «Начислено» — сколько Ozon насчитал за месяц: сумма сверена с итогом начислений по дням, две независимые ветки API сходятся. «Выплачено» — сколько Ozon перевёл за месяц, и оно больше начисленного ЗА ЭТОТ месяц законно: переводили за прошлые периоды. Проверено по отчёту кабинета о выплатах: перечисленное за месяц сходится с дашбордом после вычета «оплаты выкупов маркетплейсом», которую баланс в «выплачено» не включает. Поэтому начисленное за месяц на счёт ещё не пришло: оно придёт в следующих периодах, и это видно как остаток на конец. Статусы и плановые даты отдельных выплат этот метод не отдаёт: в кабинете они есть, в API я их не нашёл."
+                            label="Пояснение к балансу"
+                        />
+                    </span>
+                </div>
+
+                {#if monthBalance}
+                    <div class="payout-grid">
+                        <div class="payout-cell">
+                            <span class="payout-label">Начислено за месяц</span>
+                            <span class="payout-value">{moneyOrDash(monthBalance.accrued)}</span>
+                            {#if monthBalance.accrued !== null && previousFinance.net !== 0 && financeDeltaPct !== null}
+                                <span class="payout-note">
+                                    {previousLabel}: {formatCurrency(previousFinance.net)} ·
+                                    <span
+                                        class:positive={financeDeltaPct >= 0}
+                                        class:negative={financeDeltaPct < 0}
+                                        >{formatDelta(financeDeltaPct)}</span
+                                    >
+                                </span>
+                            {/if}
+                        </div>
+                        <div class="payout-cell">
+                            <span class="payout-label">Выплачено за месяц</span>
+                            <span class="payout-value">{moneyOrDash(monthBalance.paid)}</span>
+                        </div>
+                        <div class="payout-cell">
+                            <span class="payout-label">Остаток на начало</span>
+                            <span class="payout-value">{moneyOrDash(monthBalance.opening)}</span>
+                        </div>
+                        <div class="payout-cell">
+                            <span class="payout-label">Остаток на конец</span>
+                            <span class="payout-value">{moneyOrDash(monthBalance.closing)}</span>
+                        </div>
+                    </div>
+                {:else}
+                    <p class="muted-note">
+                        Баланс за этот месяц недоступен{monthPartialError
+                            ? `: ${monthPartialError}`
+                            : ""}.
+                    </p>
+                {/if}
+
+                {#if monthCashflows}
+                    <h4 class="panel-subtitle">От реализованного до счёта</h4>
+                    <p class="muted-note breakdown-note">
+                        Цепочка сверху вниз, по датам начисления. Она начинается с
+                        реализованного, а не с суммы по карточкам заказов: карточки считаются
+                        по дате создания заказа и потому описывают другой набор заказов —
+                        свести их в одну строку нельзя, и это не ошибка. Комиссия Ozon здесь
+                        отдельной строкой: в отчёте о реализации она всегда ноль, а в
+                        начислениях спрятана внутри итога.
+                    </p>
+                    <div class="week-table" role="table" aria-label="Разбор начислений">
+                        <div class="week-row breakdown-row breakdown-head" role="row">
+                            <span role="columnheader">Статья</span>
+                            <span role="columnheader">Сумма</span>
+                            <span role="columnheader">Из чего</span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell">Оплачено покупателями</span>
+                            <span role="cell">{formatCurrency(monthCashflows.sales.revenue)}</span>
+                            <span role="cell" class="breakdown-detail" data-label="Из чего">
+                                это «Реализовано» в отчёте Ozon — покупатель платит меньше твоей
+                                цены
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell">+ Доплата Ozon за скидки</span>
+                            <span role="cell">{formatCurrency(monthCashflows.sales.points)}</span>
+                            <span role="cell" class="breakdown-detail">
+                                скидку, которую дал Ozon, он же и доплачивает — в отчёте это
+                                «баллы за скидки»
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell">+ Программы партнёров</span>
+                            <span role="cell"
+                                >{formatCurrency(monthCashflows.sales.partnerPrograms)}</span
+                            >
+                            <span role="cell" class="breakdown-detail">
+                                доплаты банков и партнёров по механикам лояльности
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell">= Цена продавца по проданному</span>
+                            <span role="cell">{formatCurrency(monthCashflows.sales.amount)}</span>
+                            <span role="cell" class="breakdown-detail">
+                                сумма, которую вы выставляли: проверено на строке отчёта —
+                                642,86 + 571,71 + 6,43 = 1221,00
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell" class="negative">Комиссия Ozon</span>
+                            <span role="cell" class="negative"
+                                >{formatCurrency(monthCashflows.sales.fee)}</span
+                            >
+                            <span role="cell" class="breakdown-detail">
+                                {monthCashflows.sales.amount !== 0
+                                    ? `${formatPercent(Math.abs(monthCashflows.sales.fee / monthCashflows.sales.amount) * 100)} от продаж`
+                                    : "—"}
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell" class="negative">Возвраты</span>
+                            <span role="cell" class="negative"
+                                >{formatCurrency(monthCashflows.returns.amount)}</span
+                            >
+                            <span role="cell" class="breakdown-detail">
+                                выручка {formatCurrency(monthCashflows.returns.revenue)} · баллы
+                                {formatCurrency(monthCashflows.returns.points)}
+                            </span>
+                        </div>
+                        <div class="week-row breakdown-row" role="row">
+                            <span role="cell">Сборы по возвратам</span>
+                            <span role="cell">{formatCurrency(monthCashflows.returns.fee)}</span>
+                            <span role="cell" class="breakdown-detail">начислено в плюс</span>
+                        </div>
+                        {#each monthCashflows.services as service (service.name)}
+                            <div class="week-row breakdown-row" role="row">
+                                <span role="cell" class="negative">{serviceLabel(service.name)}</span>
+                                <span role="cell" class="negative"
+                                    >{formatCurrency(service.amount)}</span
+                                >
+                                <span role="cell" class="breakdown-detail">услуга</span>
+                            </div>
+                        {/each}
+                        <div class="week-row breakdown-row breakdown-total" role="row">
+                            <span role="cell">Итого начислено</span>
+                            <span role="cell">{formatCurrency(monthCashflows.total)}</span>
+                            <span role="cell" class="breakdown-detail">
+                                сходится с суммой начислений по дням
+                            </span>
+                        </div>
+                    </div>
+                {/if}
+
+                {#if (monthFinance?.weeks ?? []).length > 0}
+                    <h4 class="panel-subtitle">К выплате по периодам</h4>
+                    <p class="muted-note breakdown-note">
+                        Сумма начислений за период — именно её Ozon перечисляет. Сверено с
+                        отчётом кабинета о выплатах: суммы по периодам совпали до копейки.
+                        Заказы, возвраты и комиссия — из отчёта о балансе; его поля «услуги» я
+                        свести не смог (в одном периоде там положительная сумма, несовместимая
+                        с фактическими расходами), поэтому состава услуг здесь нет, а
+                        проверенный состав месяца — в блоке выше.
+                        {#if !payoutCoverageComplete}
+                            Часть периодов ещё не покрыта загруженными начислениями, поэтому
+                            «К выплате» местами пусто.
+                        {/if}
+                    </p>
+                    <div class="week-table" role="table" aria-label="Периоды выплат">
+                        <div class="week-row week-head" role="row">
+                            <span role="columnheader">Период</span>
+                            <span role="columnheader">Заказы</span>
+                            <span role="columnheader">Возвраты</span>
+                            <span role="columnheader">Комиссия</span>
+                            <span role="columnheader">К выплате</span>
+                        </div>
+                        {#each monthFinance?.weeks ?? [] as week (`${week.from}-${week.to}`)}
+                            <div class="week-row" role="row">
+                                <span role="cell" class="week-dates">
+                                    {week.from.slice(8, 10)}.{week.from.slice(5, 7)}–{week.to.slice(8, 10)}.{week.to.slice(5, 7)}
+                                </span>
+                                <span role="cell" data-label="Заказы"
+                                    >{formatCurrency(week.orders)}</span
+                                >
+                                <span role="cell" class="negative" data-label="Возвраты"
+                                    >{formatCurrency(week.returns)}</span
+                                >
+                                <span role="cell" class="negative" data-label="Комиссия"
+                                    >{formatCurrency(week.commission)}</span
+                                >
+                                <span role="cell" class="week-net" data-label="К выплате">
+                                    {moneyOrDash(payoutFor(week.from))}
+                                </span>
+                            </div>
+                        {/each}
+                        {#if payoutPeriodsTotal.complete}
+                            <div class="week-row breakdown-total" role="row">
+                                <span role="cell" data-label="Итого по периодам"
+                                    >Итого по периодам</span
+                                >
+                                <span role="cell"></span>
+                                <span role="cell"></span>
+                                <span role="cell"></span>
+                                <span role="cell" class="week-net" data-label="Итого">
+                                    {formatCurrency(payoutPeriodsTotal.total)}
+                                </span>
+                            </div>
+                        {/if}
+                    </div>
+
+                    {#if payoutPeriodsTotal.complete}
+                        <p class="muted-note breakdown-note">
+                            {#if payoutPeriodsTotal.matchesAccrued}
+                                Сумма по периодам равна «Начислено за месяц»
+                                {formatCurrency(payoutPeriodsTotal.accrued ?? 0)} — это одна и та
+                                же величина: выплаты складываются из начислений, просто месяц
+                                режется на недели. Выплачивают их позже: указанные даты —
+                                плановые, а не фактические.
+                            {:else}
+                                Сумма по периодам {formatCurrency(payoutPeriodsTotal.total)} не
+                                равна «Начислено за месяц»
+                                {formatCurrency(payoutPeriodsTotal.accrued ?? 0)} — расхождение
+                                {formatCurrency(
+                                    payoutPeriodsTotal.total -
+                                        (payoutPeriodsTotal.accrued ?? 0),
+                                )}. Это стоит разобрать, а не списать на округление.
+                            {/if}
+                        </p>
+                    {/if}
+                {/if}
+
+                {#if !$financeLoading && finance.failedDays.length > 0}
+                    <p class="muted-note" role="status">
+                        Начисления за {finance.failedDays.length}
+                        {finance.failedDays.length === 1 ? "день" : "дней"} не загрузились:
                         {finance.failedDays
                             .slice(0, 3)
                             .map((day) => day.date)
                             .join(", ")}{finance.failedDays.length > 3
                             ? ` и ещё ${finance.failedDays.length - 3}`
-                            : ""}.
+                            : ""}, поэтому суммы выше могут быть занижены — это не отсутствие
+                        начислений, а сбой загрузки.
                     </p>
+                {/if}
+
+                {#if inTransit.orders > 0 && inTransit.expectedPayout !== null}
                     <p class="muted-note">
-                        {finance.failedDays[0]?.error ?? ""}
+                        Ещё не начислено {formatCurrency(inTransit.expectedPayout)} — по
+                        {inTransit.orders} доставленным
+                        {inTransit.orders === 1 ? "заказу" : "заказам"} за
+                        {inTransit.windowDays} дн. начисления ещё не пришли. Сумма посчитана по
+                        карточкам заказов, а не Ozon, поэтому это оценка: сколько придёт, станет
+                        известно после расчёта.
                     </p>
-                </div>
-            {/if}
+                {/if}
+            </div>
 
-            <div class="breakdown-grid">
-                <div class="panel glass-panel">
-                    <span class="panel-title-row">
-                        <h3 class="panel-title">Из чего складывается по заказам</h3>
+            <div class="panel glass-panel tax-panel">
+                <div class="panel-head">
+                    <span class="panel-title-group">
+                        <h3 class="panel-title">Налог и себестоимость</h3>
                         <InfoTip
-                            text="Удержания, привязанные к отправлениям, сгруппированные по смыслу. Сумма строк не равна итогу: итог берётся из начислений как есть, а здесь показано, из чего он состоит."
-                            label="Пояснение к удержаниям"
+                            text="Порядок расчёта: деньги, полученные от Ozon, минус налог, минус себестоимость проданных товаров. По умолчанию налог 7 % считается ОТ РЕАЛИЗОВАННОГО ЗА ВЫЧЕТОМ ВОЗВРАТОВ: то есть с «Реализовано» из отчёта минус возвраты. Это не перевод от Ozon, потому что Ozon удерживает комиссию и услуги, и не полная цена продавца: «Реализовано» в отчёте — то, что заплатили покупатели, без доплат Ozon за скидки и партнёрских, хотя эти доплаты приходят вам деньгами. Поэтому итог может выйти маленьким или отрицательным — это не ошибка расчёта, а следствие того, что налог считается с выручки. База переключается ниже: «от денег, полученных от Ozon» даст меньший налог, «от прибыли» — налог с выручки за вычетом себестоимости. Себестоимость берётся из вашего справочника и только за проданные штуки, без возвращённых; если цена известна не для всех товаров месяца, итог не показывается, потому что иначе получилось бы точное на вид число из неполных данных."
+                            label="Пояснение к налогу и себестоимости"
                         />
                     </span>
-                    {#if financeGroups.length === 0}
-                        <p class="muted-note">Нет начислений за период.</p>
-                    {:else}
-                        <div class="mini-list">
-                            {#each financeGroups as row (row.group)}
-                                <div class="mini-row">
-                                    <span class="mini-name"
-                                        >{FEE_GROUP_LABELS[row.group]}</span
-                                    >
-                                    <span class="mini-value"
-                                        >{formatCurrency(row.amount)}</span
-                                    >
-                                </div>
-                            {/each}
-                        </div>
-                    {/if}
                 </div>
 
-                <div class="panel glass-panel">
-                    <span class="panel-title-row">
-                        <h3 class="panel-title">Расходы кабинета по видам</h3>
-                        <InfoTip
-                            text="Начисления без номера отправления: хранение, продвижение, сбор отзывов и прочее. Они относятся к кабинету целиком, поэтому не размазываются по заказам."
-                            label="Пояснение к расходам кабинета"
+                <div class="tax-controls">
+                    <label class="tax-field">
+                        <span>Ставка, %</span>
+                        <input
+                            type="number"
+                            min="0"
+                            max="60"
+                            step="0.1"
+                            value={$taxSettings.percent}
+                            onchange={(event) =>
+                                taxSettings.setPercent(
+                                    Number((event.currentTarget as HTMLInputElement).value),
+                                )}
                         />
-                    </span>
-                    {#if finance.cabinetLines.length === 0}
-                        <p class="muted-note">Расходов кабинета за период нет.</p>
-                    {:else}
-                        <div class="mini-list">
-                            {#each finance.cabinetLines as line (line.key)}
-                                <div class="mini-row">
-                                    <span class="mini-name" title={line.label}
-                                        >{line.label}</span
-                                    >
-                                    <span class="mini-value"
-                                        >{formatCurrency(line.amount)}</span
-                                    >
-                                </div>
+                    </label>
+                    <label class="tax-field">
+                        <span>База налога</span>
+                        <select
+                            value={$taxSettings.base}
+                            onchange={(event) =>
+                                taxSettings.setBase(
+                                    (event.currentTarget as HTMLSelectElement).value as TaxBase,
+                                )}
+                        >
+                            {#each Object.entries(TAX_BASE_LABELS) as [value, label] (value)}
+                                <option {value}>{label}</option>
                             {/each}
-                        </div>
-                    {/if}
+                        </select>
+                    </label>
                 </div>
 
-                {#if finance.orderLines.length > 0}
-                    <div class="panel glass-panel">
-                        <span class="panel-title-row">
-                            <h3 class="panel-title">Все удержания по типам</h3>
-                            <InfoTip
-                                text="Полный список типов начислений с суммами. Названия приходят из справочника Ozon; если название неизвестно, показывается идентификатор типа, а не выдуманная подпись."
-                                label="Пояснение к типам начислений"
-                            />
-                        </span>
-                        <div class="mini-list">
-                            {#each finance.orderLines.slice(0, 12) as line (line.key)}
-                                <div class="mini-row">
-                                    <span class="mini-name" title={line.label}
-                                        >{line.label}</span
-                                    >
-                                    <span class="mini-value"
-                                        >{formatCurrency(line.amount)}</span
-                                    >
-                                </div>
-                            {/each}
+                {#if monthCost.units === 0}
+                    <p class="muted-note">
+                        За {monthLabel(periodMonth)} нет проданных штук, считать нечего.
+                    </p>
+                {:else}
+                    <div class="tax-chain">
+                        <div class="chain-step">
+                            <span class="chain-label">Деньги от Ozon</span>
+                            <span class="chain-value">{formatCurrency(monthProfit.payout)}</span>
+                            <span class="chain-note">начислено за месяц</span>
+                        </div>
+                        <span class="chain-arrow" aria-hidden="true">−</span>
+                        <div class="chain-step">
+                            <span class="chain-label">Налог {$taxSettings.percent} %</span>
+                            <span class="chain-value">{formatCurrency(monthProfit.tax)}</span>
+                            <span class="chain-note">
+                                {TAX_BASE_LABELS[monthProfit.base]}:
+                                {formatCurrency(monthProfit.taxable)}
+                            </span>
+                        </div>
+                        <span class="chain-arrow" aria-hidden="true">−</span>
+                        <div class="chain-step">
+                            <span class="chain-label">Себестоимость проданного</span>
+                            <span class="chain-value">{moneyOrDash(monthCost.cost)}</span>
+                            <span class="chain-note">
+                                {monthCost.covered} из {monthCost.units} шт с известной ценой
+                            </span>
+                        </div>
+                        <span class="chain-arrow" aria-hidden="true">=</span>
+                        <div class="chain-step chain-result">
+                            <span class="chain-label">Остаётся вам</span>
+                            {#if monthProfit.net !== null}
+                                <span
+                                    class="chain-value"
+                                    class:positive={monthProfit.net >= 0}
+                                    class:negative={monthProfit.net < 0}
+                                    >{formatCurrency(monthProfit.net)}</span
+                                >
+                                <span class="chain-note">
+                                    {monthProfit.netPercent === null
+                                        ? "—"
+                                        : `${formatPercent(monthProfit.netPercent)} от денег`}
+                                </span>
+                            {:else}
+                                <span class="chain-value">—</span>
+                                <span class="chain-note">
+                                    нужна цена всех проданных штук: есть {monthCost.covered} из {monthCost.units}
+                                </span>
+                            {/if}
                         </div>
                     </div>
+
+                    {#if !monthCost.complete}
+                        <p class="muted-note">
+                            Итог скрыт намеренно: без цены на {monthCost.units -
+                                monthCost.covered} шт любая сумма была бы догадкой.
+                            {#if monthMissingCosts.length > 0}
+                                Не хватает цены:
+                                {monthMissingCosts
+                                    .slice(0, 4)
+                                    .map((line) => `${line.label} (${line.sold} шт)`)
+                                    .join(", ")}{monthMissingCosts.length > 4
+                                    ? ` и ещё ${monthMissingCosts.length - 4}`
+                                    : ""}.
+                            {/if}
+                            Заполните себестоимость в разделе «Маржа и ассортимент» — кнопка
+                            «Себестоимость»: товары из месячного отчёта в ней тоже есть.
+                        </p>
+                    {/if}
                 {/if}
             </div>
         {/if}
@@ -1333,7 +1907,7 @@
 
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Маржа и ассортимент · последние 31 день</h2>
+            <h2 class="section-title">Месяц · маржа и ассортимент</h2>
             <InfoTip
                 text="Маржа считается как «остаётся продавцу» минус себестоимость проданных штук. Себестоимость Ozon не знает и не отдаёт — её задаёт продавец, и она хранится в этом браузере. Пока себестоимость известна не по всем штукам, прибыль по товару не показывается: подставить ноль значило бы выдать отсутствие данных за убыток. ABC-разбор идёт по прибыли, когда она известна, и по остатку продавцу, пока нет."
                 label="Пояснение к марже"
@@ -1343,7 +1917,14 @@
                 class="btn-inline"
                 onclick={() => (showCogs = true)}
             >
-                Себестоимость ({marginTotals.covered}/{marginTotals.total})
+                <!--
+                    When the period holds no orders, `(0/0)` reads as an empty cost book
+                    rather than as a period with nothing to price. The book's own size is the
+                    honest thing to show there.
+                -->
+                {marginTotals.total > 0
+                    ? `Себестоимость (${marginTotals.covered}/${marginTotals.total})`
+                    : `Себестоимость · в справочнике ${costBookSize}`}
             </button>
         </div>
 
@@ -1355,6 +1936,22 @@
                         <span class="skeleton sk-chip"></span>
                     </div>
                 {/each}
+            {:else if marginTotals.total === 0}
+                <!--
+                    Distinguished from "no cost set" on purpose: the cost book is shared across
+                    periods, so an empty month must not read as though the costs were lost.
+                -->
+                <div class="panel glass-panel state-note">
+                    <p>
+                        За {periodLabel} нет заказов, поэтому считать нечего — это не про
+                        себестоимость.
+                    </p>
+                    <p class="muted-note">
+                        Введённая себестоимость хранится в этом браузере и никуда не делась:
+                        она снова появится, как только в выбранном периоде будут продажи. Если
+                        выбран текущий месяц, в нём пока мало данных — попробуйте предыдущий.
+                    </p>
+                </div>
             {:else if !marginTotals.hasAnyCost}
                 <div class="panel glass-panel state-note">
                     <p>
@@ -1441,7 +2038,11 @@
                                 <span class="mini-value"
                                     >{formatCurrency(row.value)} · {formatPercent(
                                         row.share,
-                                    )}</span
+                                    )}{commission.byKey.has(row.key)
+                                        ? ` · комиссия ${formatPercent(
+                                              (commission.byKey.get(row.key) ?? 0) * 100,
+                                          )}`
+                                        : ""}</span
                                 >
                             </div>
                             <div
@@ -1488,10 +2089,294 @@
             </div>
         {/if}
     </section>
+    <section class="insights-section">
+        <div class="bento-header">
+            <h2 class="section-title">Месяц · структура продаж</h2>
+            <InfoTip
+                text="Разбивка продаж за выбранный месяц по разным срезам. Во всех разрезах отменённые заказы не учитываются. Период задаётся переключателем вверху страницы и общий для всех панелей раздела."
+                label="Пояснение к разрезам продаж"
+            />
+        </div>
+
+        <!--
+            Both charts follow the selected month, so they share a row on a wide screen: at
+            full width a thirty-bar chart on a 1600 px container draws bars 45 px wide, which
+            reads as a bar chart of nothing in particular. Half the width halves the bars.
+        -->
+        <div class="charts-row">
+            <div class="panel glass-panel trend-panel">
+                <div class="panel-head">
+                    <span class="panel-title-group">
+                        <h3 class="panel-title">Тренд выручки продавца · {periodLabel}</h3>
+                        <InfoTip
+                            text="Цена продавца по дням за выбранный период (без отменённых заказов) — это деньги покупателя, а не поступление на счёт. Период задаётся переключателем вверху страницы и общий для всех разделов, включая график по часам."
+                            label="Пояснение к тренду выручки"
+                        />
+                    </span>
+                    <div class="panel-controls">
+                        <span class="panel-note">максимум {formatCurrency(trendMax)} в день</span>
+                    </div>
+                </div>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else}
+                    <div class="trend-chart">
+                        {#each trend as point (point.date)}
+                            <div
+                                class="trend-bar-wrap"
+                                title="{point.date}: {formatCurrency(point.netRevenue)} · {point.orders} заказов"
+                            >
+                                <div
+                                    class="trend-bar"
+                                    class:is-empty={point.netRevenue <= 0}
+                                    style="height: {Math.max(2, Math.round((point.netRevenue / trendMax) * 100))}%"
+                                ></div>
+                            </div>
+                        {/each}
+                    </div>
+                    <div class="trend-axis">
+                        <span>{trend[0]?.date ?? ""}</span>
+                        <span>{trend.at(-1)?.date ?? ""}</span>
+                    </div>
+                {/if}
+            </div>
+
+            <div class="panel glass-panel hour-panel">
+            <div class="panel-head">
+                <span class="panel-title-group">
+                    <h3 class="panel-title">Когда покупают · по часам ({periodLabel})</h3>
+                    <InfoTip
+                        text="Распределение заказов по часам суток за выбранный период (местное время). Период общий для всей страницы. Самый активный час выделен золотым."
+                        label="Пояснение к разрезу по часам"
+                    />
+                </span>
+                <div class="panel-controls">
+                    <span class="panel-note">
+                        пик {pad(peakHour.hour)}:00–{pad((peakHour.hour + 1) % 24)}:00 ·
+                        {peakHour.orders} заказов
+                    </span>
+                </div>
+            </div>
+            {#if showSkeletons}
+                <div class="sk-chart" aria-hidden="true"></div>
+            {:else}
+                <div class="hour-chart">
+                    {#each hours as point (point.hour)}
+                        <div
+                            class="hour-col"
+                            title="{pad(point.hour)}:00 — {point.orders} заказов, {formatCurrency(
+                                point.revenue,
+                            )}"
+                        >
+                            <div
+                                class="hour-bar"
+                                class:peak={point.hour === peakHour.hour &&
+                                    point.orders > 0}
+                                class:is-empty={point.orders === 0}
+                                style="height: {point.orders === 0
+                                    ? 2
+                                    : Math.max(4, Math.round((point.orders / hoursMax) * 100))}%"
+                            ></div>
+                        </div>
+                    {/each}
+                </div>
+                <div class="hour-axis">
+                    {#each hours as point (point.hour)}
+                        <span>{point.hour % 3 === 0 ? pad(point.hour) : ""}</span>
+                    {/each}
+                </div>
+            {/if}
+            </div>
+        </div>
+
+        <div class="breakdown-grid">
+            <div class="panel glass-panel">
+                <span class="panel-title-row">
+                    <h3 class="panel-title">Топ товаров · {periodLabel}</h3>
+                    <InfoTip
+                        text="Товары с наибольшей выручкой за выбранный месяц. Под названием — артикул и SKU, чтобы различать одинаковые по названию варианты; клик открывает товар в остатках. Ниже — какая доля всей выручки приходится на верхушку ассортимента (топ-20% SKU)."
+                        label="Пояснение к топу товаров"
+                    />
+                </span>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if top.length === 0}
+                    <p class="muted-note">Нет продаж за период.</p>
+                {:else}
+                    <div class="top-list">
+                        {#each top as product (product.sku)}
+                            <div class="mini-row top-row">
+                                <span class="top-name" title={product.name}>
+                                    {#if $dashboardData?.skuToImage?.[product.sku]}
+                                        <img
+                                            class="top-thumb"
+                                            src={$dashboardData.skuToImage[product.sku]}
+                                            alt=""
+                                            width="32"
+                                            height="32"
+                                            loading="lazy"
+                                            decoding="async"
+                                        />
+                                    {/if}
+                                    <span class="top-text">
+                                        <a
+                                            class="top-link"
+                                            href="/stocks?highlight={product.sku}"
+                                            >{product.name}</a
+                                        >
+                                        <span class="top-sub">
+                                            {product.offerId || "без артикула"} · SKU {
+                                                product.sku
+                                            }
+                                        </span>
+                                    </span>
+                                </span>
+                                <span class="mini-value"
+                                    >{formatCurrency(product.revenue)} · {product.units}
+                                    шт</span
+                                >
+                            </div>
+                        {/each}
+                    </div>
+                    <p class="panel-note">
+                        Топ {concentration.topCount} из {concentration.skuCount} SKU дают
+                        {formatPercent(concentration.topShare)} выручки
+                    </p>
+                {/if}
+            </div>
+
+            <div class="panel glass-panel">
+                <span class="panel-title-row">
+                    <h3 class="panel-title">География · {periodLabel}</h3>
+                    <InfoTip
+                        text="Выручка по городам доставки (analytics_data.city) за выбранный месяц. Процент — доля города в общей выручке."
+                        label="Пояснение к географии"
+                    />
+                </span>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if cities.length === 0}
+                    <p class="muted-note">Нет данных.</p>
+                {:else}
+                    <div class="mini-list">
+                        {#each cities as city (city.name)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={city.name}>{city.name}</span>
+                                <span class="mini-value"
+                                    >{formatCurrency(city.revenue)} · {formatPercent(
+                                        city.share,
+                                    )}</span
+                                >
+                            </div>
+                            <div
+                                class="mini-bar"
+                                style="width: {Math.round(city.share)}%"
+                            ></div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+
+            <div class="panel glass-panel">
+                <span class="panel-title-row">
+                    <h3 class="panel-title">Способ оплаты · {periodLabel}</h3>
+                    <InfoTip
+                        text="Выручка по группам способов оплаты (analytics_data.payment_type_group_name) за выбранный месяц."
+                        label="Пояснение к способам оплаты"
+                    />
+                </span>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if payments.length === 0}
+                    <p class="muted-note">Нет данных.</p>
+                {:else}
+                    <div class="mini-list">
+                        {#each payments as payment (payment.name)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={payment.name}
+                                    >{payment.name}</span
+                                >
+                                <span class="mini-value"
+                                    >{formatCurrency(payment.revenue)} · {formatPercent(
+                                        payment.share,
+                                    )}</span
+                                >
+                            </div>
+                            <div
+                                class="mini-bar"
+                                style="width: {Math.round(payment.share)}%"
+                            ></div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+
+            <div class="panel glass-panel">
+                <span class="panel-title-row">
+                    <h3 class="panel-title">Маршруты кластеров · {periodLabel}</h3>
+                    <InfoTip
+                        text="Откуда и куда ехал заказ (cluster_from → cluster_to). Число — количество заказов, сумма — их выручка. Кросс-кластерные маршруты обычно дороже по логистике."
+                        label="Пояснение к маршрутам кластеров"
+                    />
+                </span>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if routes.length === 0}
+                    <p class="muted-note">Нет данных.</p>
+                {:else}
+                    <div class="mini-list">
+                        {#each routes as route (route.from + "→" + route.to)}
+                            <div class="mini-row">
+                                <span class="mini-name" title="{route.from} → {route.to}"
+                                    >{route.from} → {route.to}</span
+                                >
+                                <span class="mini-value"
+                                    >{route.orders} · {formatCurrency(route.revenue)}</span
+                                >
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+
+            <div class="panel glass-panel">
+                <span class="panel-title-row">
+                    <h3 class="panel-title">Акции и теги · {periodLabel}</h3>
+                    <InfoTip
+                        text="Заказы, у которых в financial_data есть теги/акции, и их доля от всех заказов за выбранный месяц."
+                        label="Пояснение к акциям и тегам"
+                    />
+                </span>
+                {#if showSkeletons}
+                    <div class="sk-chart" aria-hidden="true"></div>
+                {:else if actionStats.length === 0}
+                    <p class="muted-note">Заказы без тегов.</p>
+                {:else}
+                    <div class="mini-list">
+                        {#each actionStats as action (action.action)}
+                            <div class="mini-row">
+                                <span class="mini-name" title={action.action}
+                                    >{action.action}</span
+                                >
+                                <span class="mini-value"
+                                    >{action.orders} · {formatCurrency(action.revenue)}</span
+                                >
+                            </div>
+                        {/each}
+                    </div>
+                    <p class="panel-note">
+                        {formatPercent(promo.promoShare)} заказов с тегами ({promo.promoOrders} из
+                        {promo.promoOrders + promo.organicOrders})
+                    </p>
+                {/if}
+            </div>
+        </div>
+    </section>
+
 
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Капитал и оборачиваемость</h2>
+            <h2 class="section-title">Склад и капитал · {periodLabel}</h2>
             <InfoTip
                 text="Сколько денег вложено в товар на складе и как быстро они возвращаются. Запас в закупке — это оборотный капитал по вашей себестоимости, а не по цене продажи. Оборачиваемость и GMROI считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним, — при ровном складе это близко к среднему. Упускается в день: товар продаётся, но его нет на складе, поэтому каждая строка показывает потерю за сутки, а не выдуманный итог за неизвестный срок простоя."
                 label="Пояснение к капиталу"
@@ -1587,441 +2472,11 @@
                 </div>
             </div>
 
-            {#if replenishment.length > 0}
-                <div class="panel glass-panel">
-                    <div class="panel-head">
-                        <span class="panel-title-group">
-                            <h3 class="panel-title">Что заказать · запас на 30 дней</h3>
-                            <InfoTip
-                                text="Количество считается по наблюдённому темпу продаж: сколько нужно, чтобы закрыть 30 дней, минус то, что уже лежит на складе. Это оценка по прошлому спросу, а не гарантия продаж."
-                                label="Пояснение к закупке"
-                            />
-                        </span>
-                    </div>
-                    <div class="mini-list">
-                        {#each replenishment as row (row.key)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={row.name}>{row.name}</span>
-                                <span class="mini-value"
-                                    >{row.stockUnits} шт → заказать {row.units} шт{#if row.money !== null}
-                                        · {formatCurrency(row.money)}{/if}</span
-                                >
-                            </div>
-                        {/each}
-                    </div>
-                </div>
-            {/if}
-
-            {#if capital.lostRows.length > 0}
-                <div class="panel glass-panel loss-panel">
-                    <div class="panel-head">
-                        <span class="panel-title-group">
-                            <h3 class="panel-title">Дефицит со спросом</h3>
-                            <InfoTip
-                                text="Товар продавался, но сейчас его нет на складе. Сумма — потеря за одни сутки при текущем темпе продаж. Сколько именно длится простой, из данных не видно, поэтому итог за период не выдумывается."
-                                label="Пояснение к дефициту"
-                            />
-                        </span>
-                    </div>
-                    <div class="loss-list">
-                        {#each capital.lostRows.slice(0, 10) as row (row.key)}
-                            <div class="loss-row">
-                                <span class="loss-name" title={row.name}>{row.name}</span>
-                                <span class="loss-money">
-                                    <span class="loss-value"
-                                        >{formatCurrency(
-                                            row.dailyLostProfit ?? row.dailyLostRevenue,
-                                        )}/день</span
-                                    >
-                                    <span class="loss-detail">
-                                        {row.demandPerDay.toFixed(1).replace(".", ",")} шт/день
-                                        {#if row.dailyLostProfit === null}
-                                            · упущенная выручка
-                                        {:else}
-                                            · упущенная маржа
-                                        {/if}
-                                    </span>
-                                </span>
-                            </div>
-                        {/each}
-                    </div>
-                </div>
-            {/if}
-            {#if turnoverDeficit.length > 0}
-                <div class="panel glass-panel">
-                    <div class="panel-head">
-                        <span class="panel-title-group">
-                            <h3 class="panel-title">Дефицит по расчёту Ozon</h3>
-                            <InfoTip
-                                text="Оборачиваемость считает сам Ozon — по своей модели спроса, отдельно по каждому SKU. Здесь только те товары, которые Ozon помечает как дефицитные, с его оценкой запаса в днях. Метод доступен не чаще одного запроса в минуту, поэтому данные берутся из кэша браузера и обновляются редко."
-                                label="Пояснение к оборачиваемости Ozon"
-                            />
-                        </span>
-                        <div class="panel-controls">
-                            <span class="panel-note">
-                                {turnover.deficit.length} в дефиците
-                                {#if $turnoverData?.truncated}
-                                    · Ozon вернул не все строки
-                                {/if}
-                            </span>
-                        </div>
-                    </div>
-                    <div class="mini-list">
-                        {#each turnoverDeficit as row (row.sku)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={row.name}>{row.name}</span>
-                                <span class="mini-value">
-                                    {row.grade ?? "без оценки"}{#if row.idc !== null}
-                                        · {row.idc.toFixed(0)} дн.{/if}
-                                    {#if row.cluster}· {row.cluster}{/if}
-                                </span>
-                            </div>
-                        {/each}
-                    </div>
-                </div>
-            {:else if $turnoverData?.error}
-                <p class="muted-note">
-                    Оборачиваемость Ozon недоступна: {$turnoverData.error}
-                </p>
-            {/if}
         {/if}
     </section>
-
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Ключевые показатели · текущий месяц</h2>
-            <InfoTip
-                text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Два последних чипа — скользящие окна 24 часа и 7 дней (не календарные) и тоже без отмен, чтобы сравнивать с главным числом дашборда."
-                label="Пояснение к ключевым показателям"
-            />
-        </div>
-        <div class="kpi-strip">
-            {#if showSkeletons}
-                {#each [1, 2, 3, 4, 5, 6, 7, 8] as chip (chip)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            {:else}
-                {#each derivedMetrics as metric (metric.label)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="kpi-label">{metric.label}</span>
-                        <span class="kpi-value">{metric.value}</span>
-                    </div>
-                {/each}
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Выручка продавца · 24ч</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(deltas.last24h.netRevenue)}</span
-                    >
-                    <span
-                        class="kpi-delta"
-                        class:positive={isUp(deltas.last24h.netRevenueChangePct)}
-                        class:negative={isDown(deltas.last24h.netRevenueChangePct)}
-                        >{formatDelta(deltas.last24h.netRevenueChangePct)} к
-                        предыдущим 24ч</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Выручка продавца · 7 дней</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(deltas.last7d.netRevenue)}</span
-                    >
-                    <span
-                        class="kpi-delta"
-                        class:positive={isUp(deltas.last7d.netRevenueChangePct)}
-                        class:negative={isDown(deltas.last7d.netRevenueChangePct)}
-                        >{formatDelta(deltas.last7d.netRevenueChangePct)} к
-                        предыдущим 7 дням</span
-                    >
-                </div>
-            {/if}
-        </div>
-
-        <div class="panel glass-panel trend-panel">
-            <div class="panel-head">
-                <span class="panel-title-group">
-                    <h3 class="panel-title">Тренд выручки продавца · {windowDays} дн.</h3>
-                    <InfoTip
-                        text="Цена продавца по дням за выбранное окно (без отменённых заказов) — это деньги покупателя, а не поступление на счёт. Окно 7/14/31 дня задаётся переключателем справа и общее для тренда и графика по часам."
-                        label="Пояснение к тренду выручки"
-                    />
-                </span>
-                <div class="panel-controls">
-                    <span class="panel-note">максимум {formatCurrency(trendMax)} в день</span>
-                    <RangeToggle bind:value={windowDays} />
-                </div>
-            </div>
-            {#if showSkeletons}
-                <div class="sk-chart" aria-hidden="true"></div>
-            {:else}
-                <div class="trend-chart">
-                    {#each trend as point (point.date)}
-                        <div
-                            class="trend-bar-wrap"
-                            title="{point.date}: {formatCurrency(point.netRevenue)} · {point.orders} заказов"
-                        >
-                            <div
-                                class="trend-bar"
-                                class:is-empty={point.netRevenue <= 0}
-                                style="height: {Math.max(2, Math.round((point.netRevenue / trendMax) * 100))}%"
-                            ></div>
-                        </div>
-                    {/each}
-                </div>
-                <div class="trend-axis">
-                    <span>{trend[0]?.date ?? ""}</span>
-                    <span>{trend.at(-1)?.date ?? ""}</span>
-                </div>
-            {/if}
-        </div>
-    </section>
-
-    <section class="insights-section">
-        <div class="bento-header">
-            <h2 class="section-title">Разрезы продаж</h2>
-            <InfoTip
-                text="Разбивка продаж за последние 31 день по разным срезам. Во всех разрезах отменённые заказы не учитываются."
-                label="Пояснение к разрезам продаж"
-            />
-        </div>
-
-        <div class="panel glass-panel hour-panel">
-            <div class="panel-head">
-                <span class="panel-title-group">
-                    <h3 class="panel-title">Когда покупают · по часам ({windowDays} дн.)</h3>
-                    <InfoTip
-                        text="Распределение заказов по часам суток за выбранное окно (местное время). Окно 7/14/31 дня — общий переключатель с трендом выше. Самый активный час выделен золотым."
-                        label="Пояснение к разрезу по часам"
-                    />
-                </span>
-                <div class="panel-controls">
-                    <span class="panel-note">
-                        пик {pad(peakHour.hour)}:00–{pad((peakHour.hour + 1) % 24)}:00 ·
-                        {peakHour.orders} заказов
-                    </span>
-                    <RangeToggle bind:value={windowDays} />
-                </div>
-            </div>
-            {#if showSkeletons}
-                <div class="sk-chart" aria-hidden="true"></div>
-            {:else}
-                <div class="hour-chart">
-                    {#each hours as point (point.hour)}
-                        <div
-                            class="hour-col"
-                            title="{pad(point.hour)}:00 — {point.orders} заказов, {formatCurrency(
-                                point.revenue,
-                            )}"
-                        >
-                            <div
-                                class="hour-bar"
-                                class:peak={point.hour === peakHour.hour &&
-                                    point.orders > 0}
-                                class:is-empty={point.orders === 0}
-                                style="height: {point.orders === 0
-                                    ? 2
-                                    : Math.max(4, Math.round((point.orders / hoursMax) * 100))}%"
-                            ></div>
-                        </div>
-                    {/each}
-                </div>
-                <div class="hour-axis">
-                    {#each hours as point (point.hour)}
-                        <span>{point.hour % 3 === 0 ? pad(point.hour) : ""}</span>
-                    {/each}
-                </div>
-            {/if}
-        </div>
-
-        <div class="breakdown-grid">
-            <div class="panel glass-panel">
-                <span class="panel-title-row">
-                    <h3 class="panel-title">Топ товаров</h3>
-                    <InfoTip
-                        text="Товары с наибольшей выручкой за 31 день. Под названием — артикул и SKU, чтобы различать одинаковые по названию варианты; клик открывает товар в остатках. Ниже — какая доля всей выручки приходится на верхушку ассортимента (топ-20% SKU)."
-                        label="Пояснение к топу товаров"
-                    />
-                </span>
-                {#if showSkeletons}
-                    <div class="sk-chart" aria-hidden="true"></div>
-                {:else if top.length === 0}
-                    <p class="muted-note">Нет продаж за период.</p>
-                {:else}
-                    <div class="top-list">
-                        {#each top as product (product.sku)}
-                            <div class="mini-row top-row">
-                                <span class="top-name" title={product.name}>
-                                    {#if $dashboardData?.skuToImage?.[product.sku]}
-                                        <img
-                                            class="top-thumb"
-                                            src={$dashboardData.skuToImage[product.sku]}
-                                            alt=""
-                                            width="32"
-                                            height="32"
-                                            loading="lazy"
-                                            decoding="async"
-                                        />
-                                    {/if}
-                                    <span class="top-text">
-                                        <a
-                                            class="top-link"
-                                            href="/stocks?highlight={product.sku}"
-                                            >{product.name}</a
-                                        >
-                                        <span class="top-sub">
-                                            {product.offerId || "без артикула"} · SKU {
-                                                product.sku
-                                            }
-                                        </span>
-                                    </span>
-                                </span>
-                                <span class="mini-value"
-                                    >{formatCurrency(product.revenue)} · {product.units}
-                                    шт</span
-                                >
-                            </div>
-                        {/each}
-                    </div>
-                    <p class="panel-note">
-                        Топ {concentration.topCount} из {concentration.skuCount} SKU дают
-                        {formatPercent(concentration.topShare)} выручки
-                    </p>
-                {/if}
-            </div>
-
-            <div class="panel glass-panel">
-                <span class="panel-title-row">
-                    <h3 class="panel-title">География</h3>
-                    <InfoTip
-                        text="Выручка по городам доставки (analytics_data.city) за 31 день. Процент — доля города в общей выручке."
-                        label="Пояснение к географии"
-                    />
-                </span>
-                {#if showSkeletons}
-                    <div class="sk-chart" aria-hidden="true"></div>
-                {:else if cities.length === 0}
-                    <p class="muted-note">Нет данных.</p>
-                {:else}
-                    <div class="mini-list">
-                        {#each cities as city (city.name)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={city.name}>{city.name}</span>
-                                <span class="mini-value"
-                                    >{formatCurrency(city.revenue)} · {formatPercent(
-                                        city.share,
-                                    )}</span
-                                >
-                            </div>
-                            <div
-                                class="mini-bar"
-                                style="width: {Math.round(city.share)}%"
-                            ></div>
-                        {/each}
-                    </div>
-                {/if}
-            </div>
-
-            <div class="panel glass-panel">
-                <span class="panel-title-row">
-                    <h3 class="panel-title">Способ оплаты</h3>
-                    <InfoTip
-                        text="Выручка по группам способов оплаты (analytics_data.payment_type_group_name) за 31 день."
-                        label="Пояснение к способам оплаты"
-                    />
-                </span>
-                {#if showSkeletons}
-                    <div class="sk-chart" aria-hidden="true"></div>
-                {:else if payments.length === 0}
-                    <p class="muted-note">Нет данных.</p>
-                {:else}
-                    <div class="mini-list">
-                        {#each payments as payment (payment.name)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={payment.name}
-                                    >{payment.name}</span
-                                >
-                                <span class="mini-value"
-                                    >{formatCurrency(payment.revenue)} · {formatPercent(
-                                        payment.share,
-                                    )}</span
-                                >
-                            </div>
-                            <div
-                                class="mini-bar"
-                                style="width: {Math.round(payment.share)}%"
-                            ></div>
-                        {/each}
-                    </div>
-                {/if}
-            </div>
-
-            <div class="panel glass-panel">
-                <span class="panel-title-row">
-                    <h3 class="panel-title">Маршруты кластеров</h3>
-                    <InfoTip
-                        text="Откуда и куда ехал заказ (cluster_from → cluster_to). Число — количество заказов, сумма — их выручка. Кросс-кластерные маршруты обычно дороже по логистике."
-                        label="Пояснение к маршрутам кластеров"
-                    />
-                </span>
-                {#if showSkeletons}
-                    <div class="sk-chart" aria-hidden="true"></div>
-                {:else if routes.length === 0}
-                    <p class="muted-note">Нет данных.</p>
-                {:else}
-                    <div class="mini-list">
-                        {#each routes as route (route.from + "→" + route.to)}
-                            <div class="mini-row">
-                                <span class="mini-name" title="{route.from} → {route.to}"
-                                    >{route.from} → {route.to}</span
-                                >
-                                <span class="mini-value"
-                                    >{route.orders} · {formatCurrency(route.revenue)}</span
-                                >
-                            </div>
-                        {/each}
-                    </div>
-                {/if}
-            </div>
-
-            <div class="panel glass-panel">
-                <span class="panel-title-row">
-                    <h3 class="panel-title">Акции и теги</h3>
-                    <InfoTip
-                        text="Заказы, у которых в financial_data есть теги/акции, и их доля от всех заказов за 31 день."
-                        label="Пояснение к акциям и тегам"
-                    />
-                </span>
-                {#if showSkeletons}
-                    <div class="sk-chart" aria-hidden="true"></div>
-                {:else if actionStats.length === 0}
-                    <p class="muted-note">Заказы без тегов.</p>
-                {:else}
-                    <div class="mini-list">
-                        {#each actionStats as action (action.action)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={action.action}
-                                    >{action.action}</span
-                                >
-                                <span class="mini-value"
-                                    >{action.orders} · {formatCurrency(action.revenue)}</span
-                                >
-                            </div>
-                        {/each}
-                    </div>
-                    <p class="panel-note">
-                        {formatPercent(promo.promoShare)} заказов с тегами ({promo.promoOrders} из
-                        {promo.promoOrders + promo.organicOrders})
-                    </p>
-                {/if}
-            </div>
-        </div>
-    </section>
-
-    <section class="insights-section">
-        <div class="bento-header">
-            <h2 class="section-title">Остатки и оборачиваемость</h2>
+            <h2 class="section-title">Склад · остатки по товарам</h2>
             <InfoTip
                 text="Сопоставление продаж за 14 дней с текущими остатками. «Продаж/день» — средний спрос в штуках, «Хватит на» — на сколько дней хватит склада при этом темпе (запас в днях)."
                 label="Пояснение к остаткам и оборачиваемости"
@@ -2082,75 +2537,11 @@
         {/if}
     </section>
 
-    <section class="insights-section">
-        <div class="bento-header">
-            <h2 class="section-title">Статусы заказов · 7 / 14 / 31 день</h2>
-            <InfoTip
-                text="Сколько заказов каждого статуса пришло за последние 7, 14 и 31 день. Окна вложенные: заказ за последние 7 дней входит и в 14, и в 31. Отменённые заказы тоже учтены."
-                label="Пояснение к статусам заказов"
-            />
-        </div>
-
-        <div class="panel glass-panel">
-            {#if statuses.rows.length === 0}
-                <p class="muted-note">За период нет заказов.</p>
-            {:else}
-                <div class="status-legend">
-                    {#each statuses.windows as window, index (window)}
-                        <span class="legend-item">
-                            <span
-                                class="legend-dot"
-                                style="background: {seriesColor(index)}"
-                            ></span>
-                            {window} дн.
-                        </span>
-                    {/each}
-                </div>
-
-                <div class="status-chart">
-                    {#each statuses.rows as row (row.status)}
-                        <div class="status-row">
-                            <span class="status-label" title={statusLabel(row.status)}
-                                >{statusLabel(row.status)}</span
-                            >
-                            <div class="status-bars">
-                                {#each row.counts as count, index}
-                                    <div class="status-bar-cell">
-                                        <div class="bar-track">
-                                            <div
-                                                class="bar-fill"
-                                                style="width: {Math.round(
-                                                    (count / statusMax) * 100,
-                                                )}%; background: {seriesColor(index)}"
-                                            ></div>
-                                        </div>
-                                        <span class="bar-count">{formatNumber(count)}</span>
-                                    </div>
-                                {/each}
-                            </div>
-                        </div>
-                    {/each}
-
-                    <div class="status-row total-row">
-                        <span class="status-label">Всего заказов</span>
-                        <div class="status-bars">
-                            {#each statuses.totals as total}
-                                <div class="status-bar-cell">
-                                    <div class="bar-track"></div>
-                                    <span class="bar-count total">{formatNumber(total)}</span>
-                                </div>
-                            {/each}
-                        </div>
-                    </div>
-                </div>
-            {/if}
-        </div>
-    </section>
 
     <section class="details-section">
         <div class="card glass full-width">
             <div class="section-header">
-                <h2>Recent FBO Orders</h2>
+                <h2>Заказы FBO</h2>
                 <div class="pagination">
                     <button
                         class="btn-page"
@@ -2167,227 +2558,178 @@
                     >
                 </div>
             </div>
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Date</th>
-                            <th style="width: 60px;">Image</th>
-                            <th>Product</th>
-                            <th>Цена → продавцу</th>
-                            <th>Status</th>
-                            <th>Payment</th>
-                            <th>Route</th>
-                            <th>Tags</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {#if $isLoading}
-                            {#each Array(5) as _}
-                                <tr>
-                                    {#each Array(8) as __}
-                                        <td><span class="skeleton"></span></td>
-                                    {/each}
-                                </tr>
-                            {/each}
-                        {:else if paginatedPostings.length > 0}
-                            {#each paginatedPostings as posting (posting.posting_number)}
-                                {@const rowMoney = rowMoneyByPosting.get(
-                                    posting.posting_number,
-                                )}
+            <div class="order-list">
+                {#if $isLoading}
+                    {#each Array(5) as _, index (index)}
+                        <div class="order-card skeleton-card">
+                            <span class="skeleton sk-line"></span>
+                            <span class="skeleton sk-line short"></span>
+                        </div>
+                    {/each}
+                {:else if paginatedPostings.length > 0}
+                    {#each paginatedPostings as posting (posting.posting_number)}
+                        {@const rowMoney = rowMoneyByPosting.get(posting.posting_number)}
+                        <article class="order-card">
+                            <header class="order-head">
+                                <span class="order-date">
+                                    {new Date(posting.created_at).toLocaleString("ru-RU", {
+                                        day: "2-digit",
+                                        month: "2-digit",
+                                        hour: "2-digit",
+                                        minute: "2-digit",
+                                    })}
+                                </span>
+                                <span class="status-pill" data-status={posting.status}
+                                    >{posting.status}</span
+                                >
+                            </header>
+
+                            <ul class="order-lines">
                                 {#each posting.products as product, i (`${product.sku || product.name}-${i}`)}
-                                    <tr>
-                                        {#if i === 0}
-                                            <td
-                                                rowspan={posting.products
-                                                    .length}
-                                                class="date-cell"
-                                            >
-                                                {new Date(
-                                                    posting.created_at,
-                                                ).toLocaleString("ru-RU", {
-                                                    day: "2-digit",
-                                                    month: "2-digit",
-                                                    hour: "2-digit",
-                                                    minute: "2-digit",
-                                                })}
-                                            </td>
-                                        {/if}
-                                        <td>
-                                            <div
-                                                class="product-image-container small"
-                                            >
-                                                {#if $dashboardData?.skuToImage?.[product.sku]}
-                                                    <img
-                                                        src={$dashboardData
-                                                            .skuToImage[
-                                                            product.sku
-                                                        ]}
-                                                        alt={product.name}
-                                                        class="product-thumb"
-                                                        width="48"
-                                                        height="48"
-                                                        loading="lazy"
-                                                        decoding="async"
-                                                    />
-                                                {:else}
-                                                    <div
-                                                        class="product-thumb-placeholder"
+                                    <li class="order-line">
+                                        <div class="product-image-container small">
+                                            {#if $dashboardData?.skuToImage?.[product.sku]}
+                                                <img
+                                                    src={$dashboardData.skuToImage[product.sku]}
+                                                    alt={product.name}
+                                                    class="product-thumb"
+                                                    width="48"
+                                                    height="48"
+                                                    loading="lazy"
+                                                    decoding="async"
+                                                />
+                                            {:else}
+                                                <div class="product-thumb-placeholder">
+                                                    <svg
+                                                        viewBox="0 0 24 24"
+                                                        width="14"
+                                                        height="14"
+                                                        fill="none"
+                                                        stroke="currentColor"
+                                                        stroke-width="2"
+                                                        ><rect
+                                                            x="3"
+                                                            y="3"
+                                                            width="18"
+                                                            height="18"
+                                                            rx="2"
+                                                            ry="2"
+                                                        /><circle
+                                                            cx="8.5"
+                                                            cy="8.5"
+                                                            r="1.5"
+                                                        /><polyline points="21 15 16 10 5 21" /></svg
                                                     >
-                                                        <svg
-                                                            viewBox="0 0 24 24"
-                                                            width="14"
-                                                            height="14"
-                                                            fill="none"
-                                                            stroke="currentColor"
-                                                            stroke-width="2"
-                                                            ><rect
-                                                                x="3"
-                                                                y="3"
-                                                                width="18"
-                                                                height="18"
-                                                                rx="2"
-                                                                ry="2"
-                                                            /><circle
-                                                                cx="8.5"
-                                                                cy="8.5"
-                                                                r="1.5"
-                                                            /><polyline
-                                                                points="21 15 16 10 5 21"
-                                                            /></svg
-                                                        >
-                                                    </div>
-                                                {/if}
-                                            </div>
-                                        </td>
-                                        <td class="name-cell">
+                                                </div>
+                                            {/if}
+                                        </div>
+
+                                        <div class="line-body">
                                             <a
                                                 href="/stocks?highlight={product.sku}"
                                                 class="product-link"
                                             >
                                                 {product.name}
                                             </a>
-                                            <div class="id-label">
-                                                SKU: {product.sku}
-                                            </div>
-                                        </td>
-                                        <td class="price-cell">
+                                            <div class="id-label">SKU: {product.sku}</div>
+
                                             {#if rowMoney?.[i]?.payout != null}
-                                                <span class="money-gross"
-                                                    >{formatCurrency(rowMoney[i].gross)}</span
-                                                >
-                                                <span class="money-arrow" aria-hidden="true"
-                                                    >→</span
-                                                >
-                                                <span class="money-net"
-                                                    >{formatCurrency(
-                                                        rowMoney[i].payout ?? 0,
-                                                    )}</span
-                                                >
+                                                <div class="line-money">
+                                                    <span class="money-gross"
+                                                        >{formatCurrency(rowMoney[i].gross)}</span
+                                                    >
+                                                    <span class="money-arrow" aria-hidden="true"
+                                                        >→</span
+                                                    >
+                                                    <span class="money-net"
+                                                        >{formatCurrency(
+                                                            rowMoney[i].payout ?? 0,
+                                                        )}</span
+                                                    >
+                                                </div>
                                                 <div class="id-label">
                                                     комиссия
                                                     {formatCurrency(
                                                         rowMoney[i].commission ?? 0,
-                                                    )}{rowMoney[i].commissionPercent !=
-                                                    null
+                                                    )}{rowMoney[i].commissionPercent != null
                                                         ? ` · ${formatPercent(rowMoney[i].commissionPercent ?? 0)}`
                                                         : ""}
                                                 </div>
                                             {:else}
-                                                {formatCurrency(
-                                                    productUnitPrice(product) *
-                                                        (product.quantity || 1),
-                                                )}
+                                                <div class="line-money">
+                                                    <span class="money-net"
+                                                        >{formatCurrency(
+                                                            productUnitPrice(product) *
+                                                                (product.quantity || 1),
+                                                        )}</span
+                                                    >
+                                                </div>
                                                 <div class="id-label">
                                                     Ozon не отдал суммы по этой строке
                                                 </div>
                                             {/if}
-                                        </td>
-                                        {#if i === 0}
-                                            <td
-                                                rowspan={posting.products
-                                                    .length}
-                                            >
-                                                <span
-                                                    class="status-pill"
-                                                    data-status={posting.status}
-                                                    >{posting.status}</span
-                                                >
-                                            </td>
-                                            <td
-                                                rowspan={posting.products
-                                                    .length}
-                                                class="small-text"
-                                                >{posting.analytics_data
-                                                    ?.payment_type_group_name ||
-                                                    "—"}</td
-                                            >
-                                            <td
-                                                rowspan={posting.products
-                                                    .length}
-                                                class="small-text"
-                                            >
-                                                <div
-                                                    class="route-info"
-                                                    class:is-cross-cluster={posting
-                                                        .financial_data
-                                                        ?.cluster_from !==
-                                                        posting.financial_data
-                                                            ?.cluster_to}
-                                                >
-                                                    <span
-                                                        >{posting.financial_data
-                                                            ?.cluster_from ||
-                                                            "—"}</span
-                                                    >
-                                                    <span class="arrow-icon"
-                                                        >→</span
-                                                    >
-                                                    <span
-                                                        >{posting.financial_data
-                                                            ?.cluster_to || "—"}
-                                                        <small
-                                                            style="opacity: 0.5; font-size: 0.8em;"
-                                                            >({posting
-                                                                .analytics_data
-                                                                ?.city ||
-                                                                "—"})</small
-                                                        ></span
-                                                    >
-                                                </div>
-                                            </td>
-                                            <td
-                                                rowspan={posting.products
-                                                    .length}
-                                            >
-                                                <div class="actions-list">
-                                                    {#if posting.actions.length > 0}
-                                                        {#each posting.actions as action}
-                                                            <span
-                                                                class="action-tag"
-                                                                >{action}</span
-                                                            >
-                                                        {/each}
-                                                    {:else}
-                                                        <span class="no-actions"
-                                                            >—</span
-                                                        >
-                                                    {/if}
-                                                </div>
-                                            </td>
-                                        {/if}
-                                    </tr>
+                                        </div>
+                                    </li>
                                 {/each}
-                            {/each}
-                        {:else}
-                            <tr>
-                                <td colspan="8" class="empty"
-                                    >За этот период заказов нет.</td
-                                >
-                            </tr>
-                        {/if}
-                    </tbody>
-                </table>
+                            </ul>
+
+                            <dl class="order-meta">
+                                <div class="meta-item">
+                                    <dt>Оплата</dt>
+                                    <dd>
+                                        {posting.analytics_data?.payment_type_group_name || "—"}
+                                    </dd>
+                                </div>
+                                <div class="meta-item">
+                                    <dt>Маршрут</dt>
+                                    <dd>
+                                        <div
+                                            class="route-info"
+                                            class:is-cross-cluster={posting.financial_data
+                                                ?.cluster_from !==
+                                                posting.financial_data?.cluster_to}
+                                        >
+                                            <span
+                                                >{posting.financial_data?.cluster_from ||
+                                                    "—"}</span
+                                            >
+                                            <span class="arrow-icon">→</span>
+                                            <span
+                                                >{posting.financial_data?.cluster_to || "—"}
+                                                <small class="meta-city"
+                                                    >({posting.analytics_data?.city ||
+                                                        "—"})</small
+                                                ></span
+                                            >
+                                        </div>
+                                    </dd>
+                                </div>
+                            </dl>
+
+                            <!--
+                                Tags get their own row rather than a third column. A posting
+                                carries up to six of them and they stacked vertically inside a
+                                narrow cell, which made one column six rows tall while the
+                                other two held a single line each — the imbalance the card was
+                                showing. Full width, they wrap into two rows at most.
+                            -->
+                            <div class="order-tags">
+                                <span class="tags-label">Теги</span>
+                                <div class="tags-list">
+                                    {#if posting.actions.length > 0}
+                                        {#each posting.actions as action}
+                                            <span class="action-tag">{action}</span>
+                                        {/each}
+                                    {:else}
+                                        <span class="no-actions">—</span>
+                                    {/if}
+                                </div>
+                            </div>
+                        </article>
+                    {/each}
+                {:else}
+                    <div class="order-empty">За этот период заказов нет.</div>
+                {/if}
             </div>
         </div>
     </section>
@@ -2396,6 +2738,40 @@
     {#if showCogs}
         <CogsPanel products={costCandidates} onClose={() => (showCogs = false)} />
     {/if}
+
+    <!--
+        Back to the top, on a pointer device only. The ring is the page's own scroll position,
+        so the control answers "how far down am I" as well as "take me up" — one element
+        instead of a button plus a progress bar. Hidden below 768 px: a thumb flicks back
+        faster than it aims at a floating target.
+    -->
+    <button
+        type="button"
+        class="to-top"
+        class:is-visible={showToTop}
+        onclick={scrollToTop}
+        title="Наверх"
+        aria-label="Вернуться наверх"
+    >
+        <!--
+            Ring and arrow in one viewBox. As separate elements — an absolutely positioned SVG
+            and a centred span — they were laid out by two different rules and drifted apart.
+            The ring is rotated inside the SVG rather than the SVG itself, so the arrow stays
+            upright: 131.95 is the circumference of r=21.
+        -->
+        <svg viewBox="0 0 48 48" aria-hidden="true">
+            <circle class="to-top-track" cx="24" cy="24" r="21" />
+            <circle
+                class="to-top-ring"
+                cx="24"
+                cy="24"
+                r="21"
+                stroke-dasharray="131.95"
+                stroke-dashoffset={131.95 * (1 - scrollProgress)}
+            />
+            <path class="to-top-arrow" d="M24 32 V17 M18.5 22.5 L24 17 L29.5 22.5" />
+        </svg>
+    </button>
 </div>
 
 <style>
@@ -2407,12 +2783,6 @@
         max-width: var(--max-content-width);
         margin: 0 auto;
         padding: var(--space-lg) var(--space-md);
-    }
-
-    .actions-list {
-        display: flex;
-        flex-direction: column;
-        gap: 0.25rem;
     }
 
     .action-tag {
@@ -2479,15 +2849,6 @@
         letter-spacing: 0.05em;
     }
 
-    .name-cell {
-        min-width: 120px;
-        max-width: clamp(150px, 20vw, 300px);
-        font-size: var(--text-sm);
-        line-height: 1.3;
-        word-wrap: break-word;
-        overflow-wrap: break-word;
-    }
-
     .product-link {
         color: var(--text-primary);
         text-decoration: none;
@@ -2528,12 +2889,6 @@
         color: #34d399;
     }
 
-    .price-cell {
-        font-weight: 500;
-        color: var(--text-primary);
-        white-space: nowrap;
-    }
-
     /* Buyer money on the left, seller money on the right — never presented as one
        number, because the difference is what the business actually earns. */
     .money-gross {
@@ -2561,6 +2916,12 @@
         transition: all 0.3s ease;
         flex-wrap: wrap;
         font-size: var(--text-sm);
+        /*
+            Hugs its own text. As a grid item it filled the whole column, so the cross-cluster
+            outline ran to the card's edge instead of marking the route it describes.
+        */
+        width: fit-content;
+        max-width: 100%;
     }
 
     .route-info.is-cross-cluster {
@@ -2598,93 +2959,154 @@
         opacity: 0.9;
     }
 
-    .table-container {
-        overflow-x: auto;
-        border-radius: var(--radius-md);
+    /*
+        Recent orders read as cards, not as a table.
+        Eight columns could not fit a phone: the mobile rule forced a 720px minimum width, so
+        the whole page scrolled sideways. A card with a product line and a row of key/value
+        pairs wraps instead, and every field the table carried is still here.
+    */
+    .order-list {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
+    }
+
+    .order-card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
+        padding: var(--space-md);
         border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
         background: var(--bg-card);
-        -webkit-overflow-scrolling: touch;
     }
 
-    table {
-        width: 100%;
-        min-width: 100%;
-        border-collapse: separate;
-        border-spacing: 0;
-        text-align: left;
-        table-layout: auto;
+    .order-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-sm);
     }
 
-    thead {
-        position: sticky;
-        top: 0;
-        z-index: 10;
-    }
-
-    th {
-        padding: var(--space-sm) var(--space-md);
-        color: var(--text-secondary);
-        font-size: var(--text-xs);
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        background: var(--bg-elevated);
-        border-bottom: 1px solid var(--border-subtle);
-        white-space: nowrap;
-    }
-
-    th:first-child {
-        border-top-left-radius: var(--radius-md);
-    }
-
-    th:last-child {
-        border-top-right-radius: var(--radius-md);
-    }
-
-    td {
-        padding: var(--space-sm) var(--space-md);
-        border-bottom: 1px solid var(--border-subtle);
+    .order-date {
         font-size: var(--text-sm);
+        font-weight: 600;
         color: var(--text-secondary);
         font-variant-numeric: tabular-nums;
-        vertical-align: middle;
-        transition: background-color var(--transition-fast);
     }
 
-    tbody tr:nth-child(even) {
-        background-color: rgba(255, 255, 255, 0.015);
+    .order-lines {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
     }
 
-    tbody tr {
-        transition: background-color var(--transition-fast);
+    .order-line {
+        display: flex;
+        gap: var(--space-sm);
+        align-items: flex-start;
+        min-width: 0;
     }
 
-    tbody tr:hover {
-        background-color: rgba(255, 255, 255, 0.04);
+    /* `min-width: 0` is what lets a long product name wrap instead of widening the card. */
+    .line-body {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
     }
 
-    tbody tr:hover td:first-child {
-        box-shadow: inset 3px 0 0 var(--accent-gold);
+    .product-link {
+        overflow-wrap: anywhere;
     }
 
-    tbody tr:last-child td {
-        border-bottom: none;
+    .line-money {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 6px;
+        margin-top: 2px;
+        font-variant-numeric: tabular-nums;
     }
 
-    tbody tr:last-child td:first-child {
-        border-bottom-left-radius: var(--radius-md);
+    /*
+        Two columns, not three: payment and route are one line each, so the pair splits the
+        row evenly and the card keeps its shape whatever a posting carries.
+    */
+    .order-meta {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+        gap: var(--space-sm) var(--space-lg);
+        margin: 0;
+        padding-top: var(--space-sm);
+        border-top: 1px solid var(--border-subtle);
     }
 
-    tbody tr:last-child td:last-child {
-        border-bottom-right-radius: var(--radius-md);
+    .order-tags {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin-top: var(--space-sm);
+        padding-top: var(--space-sm);
+        border-top: 1px solid var(--border-subtle);
     }
 
-    .empty {
-        text-align: center;
+    .tags-label {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+
+    /* Wrapping chips rather than a stack, so six tags cost two rows and not six. */
+    .tags-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .meta-item {
+        min-width: 0;
+    }
+
+    .meta-item dt {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 2px;
+    }
+
+    .meta-item dd {
+        margin: 0;
+        font-size: var(--text-sm);
+        color: var(--text-secondary);
+    }
+
+    .meta-city {
+        opacity: 0.5;
+        font-size: 0.8em;
+    }
+
+    .order-empty {
         padding: 48px 24px;
+        text-align: center;
         color: var(--text-muted);
         font-size: 0.875rem;
-        background: transparent;
+    }
+
+    .skeleton-card {
+        gap: var(--space-sm);
+    }
+
+    /* A narrower second line, so a loading card reads as a card rather than a bar. */
+    .sk-line.short {
+        width: 40%;
     }
 
     .error-card {
@@ -2729,14 +3151,20 @@
         margin-bottom: var(--space-xxl);
     }
 
+    /*
+        One rule, not two. This was declared twice — once with a bottom margin, once with
+        `margin: 0` — so the second silently cancelled the first and every section title sat
+        flush against its content, while an `opacity: 0.9` from the cancelled rule still
+        dimmed every heading. The header wrapper below carries the gap instead, which is what
+        the markup assumes.
+    */
     .section-title {
         font-family: var(--font-heading);
         font-size: 1.25rem;
-        margin-bottom: var(--space-lg);
         color: var(--text-primary);
         font-weight: 600;
         letter-spacing: 0.05em;
-        opacity: 0.9;
+        margin: 0;
     }
 
     /* Bento Grid System */
@@ -2745,15 +3173,6 @@
         align-items: center;
         gap: 1rem;
         margin-bottom: var(--space-lg);
-    }
-
-    .section-title {
-        font-family: var(--font-heading);
-        font-size: 1.25rem;
-        color: var(--text-primary);
-        font-weight: 600;
-        letter-spacing: 0.05em;
-        margin: 0;
     }
 
     .bento-grid {
@@ -3146,18 +3565,13 @@
         margin: 0;
     }
 
-    .breakdown-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
-        gap: 16px;
-    }
-
     .muted-note {
         color: var(--text-muted);
         font-size: var(--text-sm);
         margin: 0;
     }
 
+    /* Sits under a KPI strip, so it needs air rather than to touch the chips. */
     .panel-note {
         margin: var(--space-sm) 0 0;
         font-size: 0.7rem;
@@ -3196,10 +3610,6 @@
     /* Top products get their own full-width panel, so the long names have room.
        Each row still shows a thumbnail, the article and the SKU, so identical
        names (the same case in different designs) stay distinguishable. */
-    .breakdown-grid > .panel:first-child {
-        grid-column: 1 / -1;
-    }
-
     .top-list {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
@@ -3315,101 +3725,168 @@
         color: var(--text-muted);
     }
 
-    /* --- Order statuses by window --- */
-
-    .status-legend {
-        display: flex;
-        gap: var(--space-md);
-        margin-bottom: var(--space-md);
+    /*
+        The control is a ring around an arrow: the same circle reports the position and does
+        the work. Everything is in the SVG so it stays crisp at any density, and the surface
+        is translucent with a blur rather than a solid panel, so it reads as floating over the
+        page instead of sitting on it.
+    */
+    .to-top {
+        position: fixed;
+        right: var(--space-lg);
+        bottom: var(--space-lg);
+        width: 48px;
+        height: 48px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: none;
+        border-radius: 50%;
+        background: rgba(18, 18, 22, 0.72);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        color: var(--text-secondary);
+        cursor: pointer;
+        z-index: 40;
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(10px) scale(0.92);
+        transition:
+            opacity 0.25s ease,
+            transform 0.25s ease,
+            color 0.2s ease;
     }
 
-    .legend-item {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 0.7rem;
+    .to-top.is-visible {
+        opacity: 1;
+        pointer-events: auto;
+        transform: none;
+    }
+
+    .to-top:hover {
+        color: var(--text-primary);
+    }
+
+    .to-top svg {
+        /* Exactly the button's box, so the ring is centred by construction. */
+        width: 100%;
+        height: 100%;
+        display: block;
+    }
+
+    .to-top-track {
+        fill: none;
+        stroke: var(--border-subtle);
+        stroke-width: 2;
+    }
+
+    .to-top-ring {
+        fill: none;
+        stroke: var(--accent-gold);
+        stroke-width: 2;
+        stroke-linecap: round;
+        transition: stroke-dashoffset 0.1s linear;
+        /* Starts at twelve o'clock and fills clockwise, like every progress ring. Turning the
+           ring rather than the SVG keeps the arrow upright. */
+        transform: rotate(-90deg);
+        transform-origin: 24px 24px;
+    }
+
+    .to-top-arrow {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        transition: transform 0.2s ease;
+        transform-origin: 24px 24px;
+    }
+
+    .to-top:hover .to-top-arrow {
+        transform: translateY(-2px);
+    }
+
+    /* A thumb flicks back faster than it aims at a floating target. */
+    @media (max-width: 768px) {
+        .to-top {
+            display: none;
+        }
+    }
+
+    /* The ring is the only thing that moves there; a slide would contradict the request. */
+    @media (prefers-reduced-motion: reduce) {
+        .to-top,
+        .to-top-arrow,
+        .to-top-ring {
+            transition: none;
+        }
+    }
+
+    /*
+        Two per row once there is room. These panels are label-and-value rows, so at full
+        width the label sat at one edge and the number at the other with nothing between —
+        the row was mostly gap. The grid rule itself had been deleted while the class stayed
+        in the markup, which is why they were stacking one per row.
+    */
+    .breakdown-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-lg);
+    }
+
+    @media (min-width: 1100px) {
+        .breakdown-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        /* The top-products mosaic is not a list — four products across — so it keeps a full
+           row of its own rather than being squeezed into half. */
+        .breakdown-grid > .panel:first-child {
+            grid-column: 1 / -1;
+        }
+    }
+
+    /*
+        The month-over-month line under «Начислено за месяц». It was written into the markup
+        without a rule of its own, so it inherited the cell's full-size type and read as a
+        second figure rather than as a footnote to the first.
+    */
+    .payout-note {
+        display: block;
+        margin-top: 2px;
+        font-size: var(--text-xs);
         color: var(--text-muted);
     }
 
-    .legend-dot {
-        width: 9px;
-        height: 9px;
-        border-radius: 2px;
-    }
-
-    .status-chart {
+    /* The figures beside a bento number: stacked, with the little gap that separates them. */
+    .micro-stat-group {
         display: flex;
         flex-direction: column;
-        gap: 10px;
-    }
-
-    .status-row {
-        display: grid;
-        grid-template-columns: minmax(110px, 170px) 1fr;
-        align-items: center;
-        gap: var(--space-md);
-    }
-
-    .status-label {
-        font-size: var(--text-sm);
-        color: var(--text-secondary);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-
-    .status-bars {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 12px;
-    }
-
-    .status-bar-cell {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-
-    .bar-track {
-        flex: 1;
-        height: 8px;
-        border-radius: 4px;
-        background: rgba(255, 255, 255, 0.05);
-        overflow: hidden;
-    }
-
-    .bar-fill {
-        height: 100%;
-        border-radius: 4px;
-        transition: width var(--transition-base);
-    }
-
-    .bar-count {
-        min-width: 3ch;
-        text-align: right;
-        font-size: 0.72rem;
-        font-variant-numeric: tabular-nums;
-        color: var(--text-primary);
-    }
-
-    .total-row {
-        border-top: 1px solid var(--border-subtle);
-        padding-top: 10px;
-    }
-
-    .total-row .status-label {
-        color: var(--text-primary);
-        font-weight: 600;
-    }
-
-    .bar-count.total {
-        font-weight: 700;
+        gap: 2px;
     }
 
     /* --- Hourly activity --- */
 
-    .hour-panel {
+    /*
+        One row for the two month-scoped charts on a screen wide enough to hold them. The
+        container is capped at 1600 px, so below this the charts keep their own row: a
+        thirty-day chart squeezed into half of 900 px would be unreadable.
+    */
+    .charts-row {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: var(--space-lg);
         margin-bottom: var(--space-lg);
+    }
+
+    @media (min-width: 1280px) {
+        .charts-row {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+    }
+
+    .hour-panel {
+        margin-bottom: 0;
     }
 
     .hour-chart {
@@ -3494,20 +3971,6 @@
             justify-content: flex-start;
         }
 
-        /* Status rows: label above the bars. */
-        .status-row {
-            grid-template-columns: 1fr;
-            gap: 6px;
-        }
-
-        .status-label {
-            white-space: normal;
-        }
-
-        .status-bars {
-            gap: 8px;
-        }
-
         /* Charts get a little shorter and tighter. */
         .trend-chart,
         .hour-chart {
@@ -3519,10 +3982,6 @@
             gap: 3px;
         }
 
-        /* Let wide data tables scroll horizontally with readable columns. */
-        table {
-            min-width: 720px;
-        }
 
         .section-header {
             align-items: flex-start;
@@ -3762,131 +4221,297 @@
         color: var(--text-muted);
     }
 
-    /* Freshness of the financial layer, shown next to its title. */
-    .freshness {
-        margin-left: auto;
+    /* Period selector bar, sitting above every money section it controls. */
+    .period-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-md);
+        padding: var(--space-md) var(--space-lg);
+        /* A group boundary, so it takes the section rhythm rather than a panel gap. */
+        margin-bottom: var(--space-xxl);
+    }
+
+    .period-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+    }
+
+    .period-title {
+        font-family: var(--font-heading);
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--text-primary);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }
+
+    .period-note {
+        font-size: 0.72rem;
+        color: var(--text-muted);
+        line-height: 1.4;
+    }
+
+    /* --- Month: payout, weekly split, tax and cost --- */
+    .payout-panel,
+    .tax-panel {
+        margin-top: var(--space-md);
+    }
+
+    .payout-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: var(--space-sm);
+    }
+
+    .payout-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: var(--space-sm) var(--space-md);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        background: rgba(255, 255, 255, 0.02);
+    }
+
+    .payout-label {
         font-size: 0.7rem;
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: 0.06em;
-        white-space: nowrap;
     }
 
-    /* --- Action feed --- */
-
-    .action-list {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-    }
-
-    .action-card {
-        display: flex;
-        align-items: flex-start;
-        justify-content: space-between;
-        gap: var(--space-md);
-        padding: var(--space-md);
-        border: 1px solid var(--border-subtle);
-        border-left: 3px solid var(--border-hover);
-        border-radius: var(--radius-sm);
-        background: var(--bg-card);
-    }
-
-    .action-card[data-severity="high"] {
-        border-left-color: var(--error);
-    }
-
-    .action-card[data-severity="medium"] {
-        border-left-color: var(--warning);
-    }
-
-    .action-card[data-severity="low"] {
-        border-left-color: var(--info);
-    }
-
-    .action-main {
-        min-width: 0;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-    }
-
-    .action-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-    }
-
-    /* Severity is spelled out, not encoded in colour alone. */
-    .action-severity {
-        font-size: 0.62rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        padding: 2px 6px;
-        border-radius: 4px;
-        background: rgba(255, 255, 255, 0.08);
-        color: var(--text-secondary);
-        white-space: nowrap;
-    }
-
-    .action-severity[data-severity="high"] {
-        background: rgba(239, 68, 68, 0.16);
-        color: #f87171;
-    }
-
-    .action-severity[data-severity="medium"] {
-        background: rgba(234, 179, 8, 0.15);
-        color: var(--accent-gold);
-    }
-
-    .action-title {
-        font-size: var(--text-sm);
+    .payout-value {
+        font-family: var(--font-heading);
+        font-size: 1.05rem;
         font-weight: 600;
         color: var(--text-primary);
     }
 
-    .action-detail {
-        font-size: 0.75rem;
+    .panel-subtitle {
+        margin: var(--space-md) 0 var(--space-sm);
+        font-family: var(--font-heading);
+        font-size: 0.78rem;
+        font-weight: 600;
         color: var(--text-secondary);
-        line-height: 1.45;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
     }
 
-    .action-skus {
-        font-size: 0.7rem;
-        color: var(--text-muted);
-        overflow: hidden;
-        text-overflow: ellipsis;
+    /* Settlement table: eight columns, so the rows scroll rather than wrap on narrow screens. */
+    .week-table {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        overflow-x: auto;
     }
 
-    .action-amount {
-        text-align: right;
+    /*
+        Five columns: period, orders, returns, commission, payout. The service and delivery
+        columns were removed rather than kept with a caveat — the statement's `services_amount`
+        could not be reproduced from the accruals on any date basis or with a week's shift, and
+        it reports a positive service total in a period whose actual service charges are
+        negative. An unexplained figure beside verified ones invites the wrong conclusion.
+    */
+    .week-row {
+        display: grid;
+        grid-template-columns: 96px repeat(3, minmax(96px, 1fr)) minmax(104px, 1fr);
+        min-width: 520px;
+        gap: var(--space-sm);
+        align-items: center;
+        padding: 7px var(--space-sm);
+        border-radius: 4px;
+        font-size: 0.78rem;
+        font-variant-numeric: tabular-nums;
         white-space: nowrap;
     }
 
-    .action-value {
-        display: block;
-        font-family: var(--font-heading);
-        font-weight: 700;
-        font-size: 1rem;
-        color: var(--text-primary);
-        font-variant-numeric: tabular-nums;
+    .week-row:not(.week-head):nth-child(odd) {
+        background: rgba(255, 255, 255, 0.02);
     }
 
-    .action-basis {
-        display: block;
-        font-size: 0.65rem;
+    .week-head {
+        color: var(--text-muted);
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .week-dates {
+        color: var(--text-secondary);
+        font-weight: 600;
+    }
+
+    .week-net {
+        color: var(--text-primary);
+        font-weight: 600;
+    }
+
+    .negative {
+        color: var(--accent-red, #f87171);
+    }
+
+    /*
+        On a phone the five columns cannot fit, and a sideways-scrolling page is worse than a
+        taller one. Each row becomes a block of label/value pairs instead: the header row is
+        dropped, the period stands as the block's heading, and every other cell carries its
+        own label from `data-label`.
+    */
+    @media (max-width: 560px) {
+        .week-row {
+            grid-template-columns: 1fr;
+            min-width: 0;
+            gap: 3px;
+            white-space: normal;
+        }
+
+        .week-head {
+            display: none;
+        }
+
+        .week-row[role="row"] > [role="cell"] {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: var(--space-sm);
+        }
+
+        .week-row[role="row"] > [role="cell"][data-label]::before {
+            content: attr(data-label);
+            color: var(--text-muted);
+            font-size: 0.72rem;
+        }
+
+        /* The period heads its block, so it needs no value beside it. */
+        .week-dates {
+            margin-bottom: 2px;
+        }
+    }
+
+    .tax-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-md);
+        margin-bottom: var(--space-md);
+    }
+
+    .tax-field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 0.72rem;
         color: var(--text-muted);
     }
 
-    @media (max-width: 640px) {
-        .action-card {
-            flex-direction: column;
-        }
+    .tax-field input,
+    .tax-field select {
+        background: rgba(0, 0, 0, 0.4);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        color: var(--text-primary);
+        font-family: inherit;
+        font-size: 0.82rem;
+        padding: 8px 10px;
+        min-height: 38px;
+        min-width: 190px;
+    }
 
-        .action-amount {
-            text-align: left;
-        }
+    .tax-field input {
+        min-width: 96px;
+        max-width: 120px;
+    }
+
+    .tax-field input:focus-visible,
+    .tax-field select:focus-visible {
+        outline: 2px solid var(--accent-gold);
+        outline-offset: 1px;
+    }
+
+    /* The chain reads left to right: income, minus cost, minus tax, equals what is left. */
+    .tax-chain {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: stretch;
+        gap: var(--space-sm);
+    }
+
+    .chain-step {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        flex: 1 1 168px;
+        padding: var(--space-sm) var(--space-md);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        background: rgba(255, 255, 255, 0.02);
+    }
+
+    .chain-result {
+        border-color: rgba(234, 179, 8, 0.4);
+        background: rgba(234, 179, 8, 0.06);
+    }
+
+    .chain-label {
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+
+    .chain-value {
+        font-family: var(--font-heading);
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .chain-value.positive {
+        color: var(--accent-green, #4ade80);
+    }
+
+    .chain-value.negative {
+        color: var(--accent-red, #f87171);
+    }
+
+    .chain-note {
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        line-height: 1.35;
+    }
+
+    .chain-arrow {
+        align-self: center;
+        font-size: 1.1rem;
+        color: var(--text-muted);
+    }
+
+    /* Breakdown of the accrued amount: three columns, so it needs no minimum width. */
+    .breakdown-row {
+        grid-template-columns: minmax(160px, 1.1fr) minmax(100px, 0.7fr) minmax(200px, 2fr);
+        min-width: 0;
+    }
+
+    .breakdown-head {
+        color: var(--text-muted);
+    }
+
+    .breakdown-detail {
+        color: var(--text-muted);
+        font-size: 0.72rem;
+        white-space: normal;
+    }
+
+    .breakdown-total {
+        border-top: 1px solid var(--border-subtle);
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+
+    .breakdown-note {
+        margin-bottom: var(--space-sm);
     }
 </style>

@@ -198,15 +198,3 @@ export function capitalSummary({
         rows
     };
 }
-
-/** How many units to order to cover `coverDays` at the observed demand. */
-export function suggestedOrder(
-    demandPerDay: number,
-    stockUnits: number,
-    coverDays: number
-): number {
-    if (!Number.isFinite(demandPerDay) || demandPerDay <= 0) return 0;
-
-    const target = demandPerDay * coverDays;
-    return Math.max(0, Math.ceil(target - stockUnits));
-}

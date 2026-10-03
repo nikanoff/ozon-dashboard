@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     REFRESH_WINDOW_MS,
+    coversWindow,
     mergeDashboardPayload,
     needsFullLoad,
     refreshSince
@@ -57,6 +58,42 @@ describe('needsFullLoad', () => {
 describe('refreshSince', () => {
     it('asks for the refresh window', () => {
         expect(refreshSince(NOW)).toBe(new Date(NOW - REFRESH_WINDOW_MS).toISOString());
+    });
+});
+
+describe('coversWindow', () => {
+    const payload = (ranges?: Array<{ from: string; to: string }>) =>
+        ({ ranges }) as unknown as DashboardPayload;
+
+    it('is true when a fetched range contains the window asked for', () => {
+        const held = payload([{ from: '2026-09-01', to: '2026-09-30' }]);
+
+        expect(coversWindow(held, '2026-09-01', '2026-09-30')).toBe(true);
+    });
+
+    it('is false when the range stops short of the window', () => {
+        const held = payload([{ from: '2026-09-01', to: '2026-09-30' }]);
+
+        expect(coversWindow(held, '2026-09-01', '2026-10-03')).toBe(false);
+        expect(coversWindow(held, '2026-08-15', '2026-09-30')).toBe(false);
+    });
+
+    it('is false for an old month held beside a tail that misses its first day', () => {
+        // The shape that produced the bug: August 2025 loaded, so the ranges are that month
+        // and today's tail. Its earliest edge is 2025-08-01, which is before September and
+        // made the old edge comparison claim coverage of a month starting on the 1st.
+        const held = payload([
+            { from: '2025-08-01', to: '2025-08-31' },
+            { from: '2026-09-02', to: '2026-10-03' }
+        ]);
+
+        expect(coversWindow(held, '2026-09-01', '2026-09-30')).toBe(false);
+    });
+
+    it('is false for a payload from a build that did not report ranges', () => {
+        // Treated as no coverage, which costs a full load rather than a wrong merge.
+        expect(coversWindow(payload(undefined), '2026-09-01', '2026-09-30')).toBe(false);
+        expect(coversWindow(undefined, '2026-09-01', '2026-09-30')).toBe(false);
     });
 });
 

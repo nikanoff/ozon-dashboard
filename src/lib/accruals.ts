@@ -41,14 +41,25 @@ export interface Accrual {
     id: string;
     date: string;
     category: AccrualCategory;
-    /** `unit_number` — the posting this accrual belongs to; `null` for cabinet costs. */
+    /** `unit_number` — the posting for POSTING/ITEM, a document number for NON_ITEM. */
     postingNumber: string | null;
     /** `total_amount.amount`: net, and authoritative. */
     amount: number;
     /** Seller price where the response exposes it, for the revenue side of the bridge. */
     gross: number | null;
-    commission: number | null;
     fees: AccrualFee[];
+}
+
+/**
+ * True when an accrual belongs to the cabinet rather than to an order.
+ *
+ * The category decides it, **not** the presence of a `unit_number`: a live account sends
+ * `NON_ITEM` rows with a document number in that field (storage, click charges, cross
+ * docking), so testing for a missing number would file cabinet costs under orders and make
+ * per-order figures stop matching the cabinet.
+ */
+export function isCabinetLevel(accrual: Pick<Accrual, 'category' | 'postingNumber'>): boolean {
+    return accrual.category === 'NON_ITEM' || !accrual.postingNumber;
 }
 
 /**
@@ -159,10 +170,6 @@ export function toAccrual(raw: unknown): Accrual | null {
         readAmount((record.posting as { seller_price?: unknown } | undefined)?.seller_price) ??
         readAmount(record.seller_price);
 
-    const commission = fees
-        .filter((fee) => /commission/i.test(fee.typeId))
-        .reduce((sum, fee) => sum + fee.amount, 0);
-
     return {
         id: String(record.accrual_id ?? record.operation_id ?? ''),
         date: String(record.date ?? '').slice(0, 10),
@@ -172,7 +179,6 @@ export function toAccrual(raw: unknown): Accrual | null {
         postingNumber: unitNumber ? String(unitNumber) : null,
         amount,
         gross,
-        commission: commission === 0 ? null : commission,
         fees
     };
 }
@@ -211,13 +217,14 @@ export function summariseDay(
             addTo(summary.byType, fee.typeId, fee.amount);
         }
 
-        if (accrual.postingNumber) {
+        if (accrual.postingNumber && !isCabinetLevel(accrual)) {
             summary.counts.withPosting += 1;
             if (summary.byPosting) {
                 addTo(summary.byPosting, accrual.postingNumber, accrual.amount);
             }
         } else {
-            // Storage, advertising, review collection: the cabinet's own costs.
+            // Storage, click charges, cross docking: the cabinet's own costs, kept apart so
+            // a per-order figure keeps matching the cabinet.
             summary.counts.cabinet += 1;
             summary.cabinetByType.total = (summary.cabinetByType.total ?? 0) + accrual.amount;
             for (const fee of accrual.fees) {
@@ -229,20 +236,38 @@ export function summariseDay(
     return summary;
 }
 
-/** Reads the `type_id` catalogue out of either documented response envelope. */
+/**
+ * Reads the `type_id` catalogue.
+ *
+ * A live account returns `{ accrual_types: [{ id, name, description }] }`, where `name` is
+ * an English code-like label ("Acquiring", "BackwardShipment") and **`description` is the
+ * Russian wording** ("Эквайринг", "Обратная магистраль") that belongs in the interface.
+ * The other envelopes are still accepted, since only one account's shape has been seen.
+ */
 export function toTypeCatalogue(raw: unknown): Record<string, string> {
     const response = (raw ?? {}) as {
+        accrual_types?: unknown[];
         types?: unknown[];
         result?: { types?: unknown[] };
     };
-    const list = response.types ?? response.result?.types ?? [];
+    const list = response.accrual_types ?? response.types ?? response.result?.types ?? [];
     const types: Record<string, string> = {};
 
     for (const entry of list) {
         if (!entry || typeof entry !== 'object') continue;
-        const { id, name } = entry as { id?: unknown; name?: unknown };
-        if (id === undefined || typeof name !== 'string' || !name) continue;
-        types[String(id)] = name;
+        const { id, name, description } = entry as {
+            id?: unknown;
+            name?: unknown;
+            description?: unknown;
+        };
+        if (id === undefined) continue;
+
+        const label =
+            (typeof description === 'string' && description) ||
+            (typeof name === 'string' && name) ||
+            String(id);
+
+        types[String(id)] = label;
     }
 
     return types;

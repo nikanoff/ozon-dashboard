@@ -19,15 +19,6 @@ const OVERSTOCK_DAYS = 60;
 
 export type StockHealth = 'out' | 'critical' | 'low' | 'ok' | 'overstock' | 'dead';
 
-export const STOCK_HEALTH_LABELS: Record<StockHealth, string> = {
-    out: 'Нет в наличии',
-    critical: 'Критично',
-    low: 'Заканчивается',
-    ok: 'В норме',
-    overstock: 'Избыток',
-    dead: 'Без продаж'
-};
-
 export interface InventoryRow {
     sku: number;
     name: string;

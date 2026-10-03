@@ -21,3 +21,6 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Business data: reconciliation outputs contain real revenue and are never committed.
+reports/

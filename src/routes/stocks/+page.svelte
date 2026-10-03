@@ -44,12 +44,14 @@
     // SKU to scroll to, taken from the URL (`/stocks?highlight=<sku>`).
     const highlightSku = $derived(page.url.searchParams.get("highlight"));
 
-    // Runs once the table reflects the loaded data.
+    // Runs once the list reflects the loaded data.
     $effect(() => {
         const sku = highlightSku;
         if (!sku || !$stocksData?.items?.length) return;
 
-        const element = document.querySelector(`tr[data-sku="${sku}"]`);
+        // Matched by attribute alone, not by tag: the row used to be a table row and is a
+        // card now, and the selector silently found nothing while both existed.
+        const element = document.querySelector(`[data-sku="${CSS.escape(sku)}"]`);
         if (!element) return;
 
         element.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -113,135 +115,103 @@
             <div class="section-header">
                 <h2>Product Stocks Inventory</h2>
             </div>
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th style="width: 80px;">Image</th>
-                            <th>Product / SKU / Offer</th>
-                            <th>FBO Stock</th>
-                            <th>Reserved</th>
-                            <th>Total</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {#if $isLoading}
-                            {#each Array(5) as _}
-                                <tr>
-                                    <td
-                                        ><span
-                                            class="skeleton"
-                                            style="width: 50px; height: 50px;"
-                                        ></span></td
+            <div class="stock-list">
+                {#if $isLoading}
+                    {#each Array(5) as _, index (index)}
+                        <div class="stock-card" aria-hidden="true">
+                            <span class="skeleton stock-thumb"></span>
+                            <span class="skeleton stock-line"></span>
+                        </div>
+                    {/each}
+                {:else if $stocksData && $stocksData.items}
+                    {#each $stocksData.items as item, index (`${item.product_id}-${index}`)}
+                        <article
+                            class="stock-card"
+                            class:highlighted={String(item.stocks?.[0]?.sku) ===
+                                highlightSku}
+                            data-sku={item.stocks?.[0]?.sku}
+                        >
+                            <div class="product-image-container">
+                                {#if $stocksData?.imagesMap?.[String(item.product_id)]}
+                                    <img
+                                        src={$stocksData.imagesMap[String(item.product_id)]}
+                                        alt={item.offer_id}
+                                        class="product-thumb"
+                                        width="48"
+                                        height="48"
+                                        loading="lazy"
+                                        decoding="async"
+                                    />
+                                {:else}
+                                    <div class="product-thumb-placeholder">
+                                        <svg
+                                            viewBox="0 0 24 24"
+                                            width="16"
+                                            height="16"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="2"
+                                            ><rect
+                                                x="3"
+                                                y="3"
+                                                width="18"
+                                                height="18"
+                                                rx="2"
+                                                ry="2"
+                                            /><circle cx="8.5" cy="8.5" r="1.5" /><polyline
+                                                points="21 15 16 10 5 21"
+                                            /></svg
+                                        >
+                                    </div>
+                                {/if}
+                            </div>
+
+                            <div class="stock-body">
+                                <code class="offer-id">{item.offer_id}</code>
+                                <div class="stock-ids">
+                                    <span class="sku-label"
+                                        >SKU: {item.stocks?.[0]?.sku || "N/A"}</span
                                     >
-                                    <td><span class="skeleton"></span></td>
-                                    <td><span class="skeleton"></span></td>
-                                    <td><span class="skeleton"></span></td>
-                                    <td><span class="skeleton"></span></td>
-                                </tr>
-                            {/each}
-                        {:else if $stocksData && $stocksData.items}
-                            {#each $stocksData.items as item, index (`${item.product_id}-${index}`)}
-                                <tr
-                                    class:highlighted={String(
-                                        item.stocks?.[0]?.sku,
-                                    ) === highlightSku}
-                                    data-sku={item.stocks?.[0]?.sku}
-                                >
-                                    <td>
-                                        <div class="product-image-container">
-                                            {#if $stocksData?.imagesMap?.[String(item.product_id)]}
-                                                <img
-                                                    src={$stocksData.imagesMap[
-                                                        String(item.product_id)
-                                                    ]}
-                                                    alt={item.offer_id}
-                                                    class="product-thumb"
-                                                    width="48"
-                                                    height="48"
-                                                    loading="lazy"
-                                                    decoding="async"
-                                                />
-                                            {:else}
-                                                <div
-                                                    class="product-thumb-placeholder"
-                                                >
-                                                    <svg
-                                                        viewBox="0 0 24 24"
-                                                        width="16"
-                                                        height="16"
-                                                        fill="none"
-                                                        stroke="currentColor"
-                                                        stroke-width="2"
-                                                        ><rect
-                                                            x="3"
-                                                            y="3"
-                                                            width="18"
-                                                            height="18"
-                                                            rx="2"
-                                                            ry="2"
-                                                        /><circle
-                                                            cx="8.5"
-                                                            cy="8.5"
-                                                            r="1.5"
-                                                        /><polyline
-                                                            points="21 15 16 10 5 21"
-                                                        /></svg
-                                                    >
-                                                </div>
-                                            {/if}
-                                        </div>
-                                    </td>
-                                    <td class="product-info-td">
-                                        <div class="product-info">
-                                            <code class="offer-id"
-                                                >{item.offer_id}</code
-                                            >
-                                            <span class="sku-label"
-                                                >SKU: {item.stocks?.[0]?.sku ||
-                                                    "N/A"}</span
-                                            >
-                                            <span class="id-label"
-                                                >PID: {item.product_id}</span
-                                            >
-                                        </div>
-                                    </td>
-                                    <td
-                                        >{item.stocks.find(
-                                            (s) => s.type === "fbo",
-                                        )?.present || 0}</td
-                                    >
-                                    <td
-                                        >{item.stocks.reduce(
-                                            (acc, s) =>
-                                                acc + (s.reserved || 0),
-                                            0,
-                                        )}</td
-                                    >
-                                    <td
-                                        >{item.stocks.reduce(
-                                            (acc, s) => acc + s.present,
-                                            0,
-                                        )}</td
-                                    >
-                                </tr>
-                            {/each}
-                        {:else if error}
-                            <tr>
-                                <td colspan="5" class="empty"
-                                    >Данные не загружены — смотрите сообщение об
-                                    ошибке выше.</td
-                                >
-                            </tr>
-                        {:else}
-                            <tr>
-                                <td colspan="5" class="empty"
-                                    >Товаров нет.</td
-                                >
-                            </tr>
-                        {/if}
-                    </tbody>
-                </table>
+                                    <span class="id-label">PID: {item.product_id}</span>
+                                </div>
+
+                                <dl class="stock-figures">
+                                    <div class="figure">
+                                        <dt>FBO</dt>
+                                        <dd
+                                            >{item.stocks.find((s) => s.type === "fbo")
+                                                ?.present || 0}</dd
+                                        >
+                                    </div>
+                                    <div class="figure">
+                                        <dt>В резерве</dt>
+                                        <dd
+                                            >{item.stocks.reduce(
+                                                (acc, s) => acc + (s.reserved || 0),
+                                                0,
+                                            )}</dd
+                                        >
+                                    </div>
+                                    <div class="figure">
+                                        <dt>Всего</dt>
+                                        <dd
+                                            >{item.stocks.reduce(
+                                                (acc, s) => acc + s.present,
+                                                0,
+                                            )}</dd
+                                        >
+                                    </div>
+                                </dl>
+                            </div>
+                        </article>
+                    {/each}
+                {:else if error}
+                    <div class="stock-empty">
+                        Данные не загружены — смотрите сообщение об ошибке выше.
+                    </div>
+                {:else}
+                    <div class="stock-empty">Товаров нет.</div>
+                {/if}
             </div>
         </div>
     </section>
@@ -301,111 +271,107 @@
         opacity: 0.9;
     }
 
-    .table-container {
-        overflow-x: auto;
-        border-radius: var(--radius-md);
+    /*
+        Stock rows are cards, not table rows.
+        Five columns could not fit a phone, and the mobile rule forced a 560px minimum width,
+        so the whole page scrolled sideways. A card holds the same five fields and wraps.
+    */
+    .stock-list {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
+    }
+
+    .stock-card {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-md);
+        padding: var(--space-md);
         border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
         background: var(--bg-card);
-        -webkit-overflow-scrolling: touch;
-    }
-
-    table {
-        width: 100%;
-        min-width: 100%;
-        border-collapse: separate;
-        border-spacing: 0;
-        text-align: left;
-        table-layout: auto;
-    }
-
-    thead {
-        position: sticky;
-        top: 0;
-        z-index: 10;
-    }
-
-    th {
-        padding: var(--space-sm) var(--space-md);
-        color: var(--text-secondary);
-        font-size: var(--text-xs);
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        background: var(--bg-elevated);
-        border-bottom: 1px solid var(--border-subtle);
-        white-space: nowrap;
-    }
-
-    th:first-child {
-        border-top-left-radius: var(--radius-md);
-    }
-
-    th:last-child {
-        border-top-right-radius: var(--radius-md);
-    }
-
-    td {
-        padding: var(--space-sm) var(--space-md);
-        border-bottom: 1px solid var(--border-subtle);
-        font-size: var(--text-sm);
-        color: var(--text-secondary);
-        font-variant-numeric: tabular-nums;
-        vertical-align: middle;
         transition: background-color var(--transition-fast);
     }
 
-    tbody tr:nth-child(even) {
-        background-color: rgba(255, 255, 255, 0.015);
-    }
-
-    tbody tr {
-        transition: background-color var(--transition-fast);
-    }
-
-    tbody tr:hover {
+    .stock-card:hover {
         background-color: rgba(255, 255, 255, 0.04);
     }
 
-    tbody tr:hover td:first-child {
-        box-shadow: inset 3px 0 0 var(--accent-gold);
-    }
-
-    tbody tr:last-child td {
-        border-bottom: none;
-    }
-
-    tbody tr:last-child td:first-child {
-        border-bottom-left-radius: var(--radius-md);
-    }
-
-    tbody tr:last-child td:last-child {
-        border-bottom-right-radius: var(--radius-md);
-    }
-
-    .product-info {
+    /* `min-width: 0` is what lets a long article code wrap instead of widening the card. */
+    .stock-body {
+        flex: 1 1 auto;
+        min-width: 0;
         display: flex;
         flex-direction: column;
         gap: var(--space-xs);
-        min-width: 100px;
-        max-width: clamp(150px, 25vw, 350px);
-        word-wrap: break-word;
-        overflow-wrap: break-word;
     }
 
-    tr.highlighted {
-        background-color: rgba(212, 175, 55, 0.1) !important;
-        position: relative;
-        z-index: 1;
+    .stock-ids {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-sm);
     }
 
-    tr.highlighted td:first-child {
-        box-shadow: inset 3px 0 0 var(--accent-gold);
+    .stock-figures {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+        gap: var(--space-sm);
+        margin: var(--space-xs) 0 0;
+        padding-top: var(--space-sm);
+        border-top: 1px solid var(--border-subtle);
     }
 
-    tr.highlighted .product-info,
-    tr.highlighted .sku-label,
-    tr.highlighted .offer-id {
-        color: #d4af37 !important; /* Gold text color */
+    .figure {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+    }
+
+    .figure dt {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    .figure dd {
+        margin: 0;
+        font-size: var(--text-sm);
+        font-weight: 600;
+        color: var(--text-primary);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .stock-empty {
+        padding: 48px 24px;
+        text-align: center;
+        color: var(--text-muted);
+        font-size: 0.875rem;
+    }
+
+    .skeleton.stock-thumb {
+        width: 48px;
+        height: 48px;
+        flex: 0 0 auto;
+        border-radius: var(--radius-sm);
+    }
+
+    .skeleton.stock-line {
+        flex: 1 1 auto;
+        height: 1.5rem;
+    }
+
+
+    /* The item the reader followed a link to: gold border and gold text, as before. */
+    .stock-card.highlighted {
+        background-color: rgba(212, 175, 55, 0.1);
+        border-color: rgba(212, 175, 55, 0.5);
+    }
+
+    .stock-card.highlighted .offer-id,
+    .stock-card.highlighted .sku-label {
+        color: #d4af37;
         font-weight: 600;
     }
 
@@ -454,13 +420,6 @@
         font-family: monospace;
     }
 
-    .empty {
-        text-align: center;
-        padding: 48px 24px;
-        color: var(--text-muted);
-        font-size: 0.875rem;
-        background: transparent;
-    }
 
     .skeleton {
         display: inline-block;
@@ -557,13 +516,5 @@
             font-size: 1.05rem;
         }
 
-        /* Keep columns readable and let the table scroll sideways. */
-        table {
-            min-width: 560px;
-        }
-
-        .product-info {
-            max-width: none;
-        }
     }
 </style>

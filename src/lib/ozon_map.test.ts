@@ -29,8 +29,8 @@ const rawPosting: OzonPosting = {
             {
                 product_id: 42,
                 payout: 1400.5,
-                commission_amount: 298.5,
-                commission_percent: 17.6,
+                // The live shape, confirmed against a real account: an object, negative amount.
+                commission: { amount: -298.5, percent: 17.6, currency: 'RUB' },
                 price: 1699,
                 old_price: 2199,
                 total_discount_value: 500,
@@ -78,8 +78,9 @@ describe('toDashboardPosting', () => {
             {
                 product_id: 42,
                 payout: 1400.5,
-                commission_amount: 298.5,
-                commission_percent: 17.6,
+                commission: { amount: -298.5, percent: 17.6, currency: 'RUB' },
+                commission_amount: undefined,
+                commission_percent: undefined,
                 price: 1699,
                 old_price: 2199,
                 total_discount_value: 500,
@@ -90,6 +91,7 @@ describe('toDashboardPosting', () => {
             {
                 product_id: undefined,
                 payout: undefined,
+                commission: undefined,
                 commission_amount: undefined,
                 commission_percent: undefined,
                 price: undefined,

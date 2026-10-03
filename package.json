@@ -15,7 +15,10 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"verify:api": "node scripts/verify-ozon-api.mjs"
+		"verify:api": "node scripts/verify-ozon-api.mjs",
+		"verify:endpoints": "node scripts/verify-endpoints.mjs",
+		"reconcile:accruals": "node scripts/reconcile-month.mjs",
+		"reconcile:report": "node scripts/compare-realization-report.mjs"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-auto": "^7.0.0",

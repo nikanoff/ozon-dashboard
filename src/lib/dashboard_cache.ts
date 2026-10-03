@@ -3,10 +3,10 @@ import type { DashboardPayload, DashboardPosting } from './ozon_types';
 /**
  * Incremental refresh.
  *
- * The dashboard covers 31 days, but only the recent tail of that history can still
- * change (a posting moves from awaiting_packaging to delivered, or gets cancelled).
- * A refresh therefore re-reads just the tail and folds it into the payload already
- * on screen, instead of downloading the whole month again.
+ * The dashboard loads 62 days of orders, but only the recent tail of that history can still
+ * change (a posting moves from awaiting_packaging to delivered, or gets cancelled). A refresh
+ * therefore re-reads just the tail and folds it into the payload already on screen, instead
+ * of downloading the whole window again.
  */
 
 /** How far back a refresh re-reads. Older postings are treated as settled. */
@@ -35,6 +35,27 @@ export function refreshSince(now = Date.now()): string {
 }
 
 /**
+ * Whether a payload already holds the window being asked for.
+ *
+ * Asked of the ranges the payload was fetched with, not of its earliest edge. A payload can
+ * hold two disjoint ranges — the month on screen and today's tail, with the months between
+ * them never fetched — and then the earliest edge is the older range's start. That start sits
+ * *before* a later month, so comparing against it claims coverage the payload does not have.
+ *
+ * It cost the first day of September: a payload holding August 2025 beside a tail from
+ * 2 September reported 2025-08-01 as its edge, was judged to cover September, and was merged
+ * with a tail that had nothing for the 1st. A payload from an older build has no ranges and
+ * is treated as not covering anything, which costs a full load and nothing else.
+ */
+export function coversWindow(
+    payload: DashboardPayload | undefined,
+    from: string,
+    to: string
+): boolean {
+    return payload?.ranges?.some((range) => range.from <= from && range.to >= to) ?? false;
+}
+
+/**
  * Folds a partial refresh into the payload on screen: fresh rows win (their status
  * may have changed), everything else is kept until it falls out of the widest
  * period the dashboard shows.
@@ -59,6 +80,9 @@ export function mergeDashboardPayload(
         ),
         skuToImage: { ...previous.skuToImage, ...fresh.skuToImage },
         fetchedAt: fresh.fetchedAt,
-        oldestAllowed: fresh.oldestAllowed
+        oldestAllowed: fresh.oldestAllowed,
+        // The ranges the fresh request covered: what the merged payload can now be said to
+        // hold. A merged payload keeps the older rows, but only within these edges.
+        ranges: fresh.ranges ?? previous.ranges
     };
 }
