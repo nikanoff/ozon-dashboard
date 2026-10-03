@@ -3,6 +3,12 @@
      * A small info icon that reveals an explanation bubble on hover or keyboard
      * focus. Pure CSS (no state), so it stays out of the way — and it works on
      * touch via the focus state.
+     *
+     * The bubble is anchored to the icon and grows to the right, which on a phone pushes it
+     * off the screen whenever the icon sits near the right edge — and half the icons here do,
+     * because they follow a heading. Which side has room differs from one icon to the next, so
+     * the offset is measured when the bubble opens and the bubble is slid back inside the
+     * viewport; the caret moves with it, so it keeps pointing at the icon.
      */
     interface Props {
         /** Explanation shown in the bubble. */
@@ -12,9 +18,43 @@
     }
 
     let { text, label = "Пояснение" }: Props = $props();
+
+    /** Widest the bubble gets, matching `max-width` below. */
+    const BUBBLE_WIDTH = 280;
+    /** Keeps the bubble off the very edge of the screen. */
+    const EDGE = 8;
+
+    let tip = $state<HTMLElement | null>(null);
+    /** How far to slide the bubble, in pixels; negative moves it left. */
+    let shift = $state(0);
+
+    function place() {
+        if (!tip) return;
+
+        const viewport = window.innerWidth;
+        const rect = tip.getBoundingClientRect();
+        const width = Math.min(BUBBLE_WIDTH, viewport * 0.78);
+
+        // Where the bubble sits by default, and where it has to sit to fit.
+        const natural = rect.left - EDGE;
+        let fitted = natural;
+        if (fitted + width > viewport - EDGE) fitted = viewport - EDGE - width;
+        if (fitted < EDGE) fitted = EDGE;
+
+        shift = fitted - natural;
+    }
 </script>
 
-<span class="info-tip" tabindex="0" role="button" aria-label={label}>
+<span
+    class="info-tip"
+    bind:this={tip}
+    tabindex="0"
+    role="button"
+    aria-label={label}
+    onfocus={place}
+    onmouseenter={place}
+    style="--shift: {shift}px"
+>
     <svg
         class="info-icon"
         viewBox="0 0 24 24"
@@ -95,7 +135,8 @@
         white-space: normal;
         opacity: 0;
         visibility: hidden;
-        transform: translateY(-6px);
+        /* `--shift` is the horizontal correction measured in `place()`. */
+        transform: translateX(var(--shift, 0px)) translateY(-6px);
         transition:
             opacity var(--transition-fast),
             transform var(--transition-fast),
@@ -103,11 +144,11 @@
         pointer-events: none;
     }
 
-    /* Small arrow pointing back at the icon. */
+    /* Small arrow pointing back at the icon — and following it when the bubble slides. */
     .info-caret {
         position: absolute;
         top: -5px;
-        left: 15px;
+        left: calc(15px - var(--shift, 0px));
         width: 9px;
         height: 9px;
         background: #1c1c1f;
@@ -121,6 +162,19 @@
     .info-tip:focus-within .info-bubble {
         opacity: 1;
         visibility: visible;
-        transform: translateY(0);
+        transform: translateX(var(--shift, 0px)) translateY(0);
+    }
+
+    /*
+        A phone also has to bound the bubble vertically: some explanations run to several
+        hundred characters, and at 280 px wide that is taller than the screen. Scrolling
+        inside it keeps the whole text reachable.
+    */
+    @media (max-width: 720px) {
+        .info-bubble {
+            max-height: 60vh;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
     }
 </style>
