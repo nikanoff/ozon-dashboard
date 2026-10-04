@@ -687,14 +687,33 @@
     // without choosing anything. Each card is assembled from the same four sources as the
     // rest of the page — orders, accruals, returns and the cost book — and every money figure
     // is withheld rather than guessed when one of them is missing.
-    /** Everything one card knows, which is what its tooltips explain. */
-    interface CardFigures {
-        window: { open: boolean; label: string; range: string; from: string; to: string };
+    /** The figures of one window — a card's, or the window it is compared against. */
+    interface CardMeasurements {
         orders: OrdersTotals;
         returns: ReturnsTotals;
         accrual: AccrualTotals;
         cost: CogsTotals;
         profit: CardProfit;
+    }
+
+    /** Everything one card knows, which is what its tooltips explain. */
+    interface CardFigures extends CardMeasurements {
+        window: {
+            open: boolean;
+            label: string;
+            range: string;
+            from: string;
+            to: string;
+            compare: { from: string; to: string; range: string; short: string } | null;
+        };
+        /**
+         * The window the percentage is measured against, or `null` where there is none.
+         *
+         * A change with no visible base is a number the reader has to guess at, which is what
+         * «+62,9 %» on the card was: it now names the window, and the breakdown states both
+         * figures — so the reader can check the arithmetic instead of trusting the sign.
+         */
+        previous: CardMeasurements | null;
     }
 
     /** One row of a tooltip: a name on the left, a figure on the right. */
@@ -740,6 +759,36 @@
         const grossMoney = sales + cancelledSum;
 
         if (metric === "sales") {
+            /*
+                The percentage on the card is a change against a window of the same shape: a day
+                against a day, the month so far against the same days of the previous month. An
+                open window has no percentage at all — a part compared to a whole reads as a
+                collapse — and the row says so rather than staying silent. Where the two windows
+                differ in length, the footer says that too, because a 30-day month against a
+                31-day one carries three per cent of length in the comparison.
+            */
+            const comparison: TipRow[] = [];
+            const compareWindow = card.window.compare;
+            if (card.window.open) {
+                comparison.push({
+                    label: "Сравнение",
+                    value: "не показано: окно ещё не закрыто",
+                    tone: "aside",
+                });
+            } else if (compareWindow && card.previous) {
+                const change = deltaPercent(sales, card.previous.orders.sales);
+                comparison.push({
+                    label: `Sales в окне сравнения — ${compareWindow.range}`,
+                    value: exact(card.previous.orders.sales),
+                    tone: "aside",
+                });
+                comparison.push({
+                    label: "Изменение к нему",
+                    value: formatDelta(change),
+                    tone: "aside",
+                });
+            }
+
             return {
                 rows: [
                     { label: "Заказов без отмен", value: count(card.orders.orders) },
@@ -766,13 +815,22 @@
                         tone: "aside",
                     },
                     { label: "В среднем в день", value: perDay(sales), tone: "aside" },
+                    ...comparison,
                 ],
                 footer:
                     `Цена продавца по не отменённым заказам, созданным в окне «${card.window.range}». ` +
                     "Это деньги покупателя: комиссия Ozon, логистика, эквайринг и реклама из них ещё " +
                     "не вычтены, поэтому Sales не равен тому, что придёт на счёт. Кросс-кластерные " +
                     "отправления — те, что едут между кластерами: логистика по ним дороже. Источник — " +
-                    "лента заказов /v3/posting/fbo/list по дате создания заказа.",
+                    "лента заказов /v3/posting/fbo/list по дате создания заказа." +
+                    (card.window.open
+                        ? ""
+                        : ` Процент на плашке — изменение Sales к окну «${compareWindow?.range}»: ` +
+                          (compareWindow && daysBetween(compareWindow.from, compareWindow.to).length !== days
+                              ? `окна разной длины (${count(days)} против ` +
+                                `${count(daysBetween(compareWindow.from, compareWindow.to).length)} дн.), ` +
+                                "поэтому в проценте есть и разница в длине периода."
+                              : "окна одной длины, так что изменение — это изменение продаж.")),
             };
         }
 
@@ -1065,6 +1123,27 @@
                     tone: "aside",
                 });
             }
+            // The second percentage on a card, explained the same way as the first.
+            const compareWindow = card.window.compare;
+            const was = card.previous?.profit.netProfit ?? null;
+            if (card.window.open) {
+                rows.push({
+                    label: "Сравнение",
+                    value: "не показано: окно ещё не закрыто",
+                    tone: "aside",
+                });
+            } else if (compareWindow && was !== null) {
+                rows.push({
+                    label: `Остаётся в окне сравнения — ${compareWindow.range}`,
+                    value: exact(was),
+                    tone: "aside",
+                });
+                rows.push({
+                    label: "Изменение к нему",
+                    value: formatDelta(deltaPercent(card.profit.netProfit, was)),
+                    tone: "aside",
+                });
+            }
         }
         if (!card.profit.costKnown && card.cost.units > 0) {
             rows.push({
@@ -1256,6 +1335,7 @@
             return {
                 window,
                 ...current,
+                previous,
                 deltaSales:
                     comparable && previous
                         ? deltaPercent(current.orders.sales, previous.orders.sales)
@@ -1764,7 +1844,10 @@
                                         <span
                                             class="metric-delta"
                                             class:negative={card.deltaSales < 0}
-                                            >{formatDelta(card.deltaSales)}</span
+                                            >{formatDelta(card.deltaSales)}{#if card.window.compare}<span
+                                                    class="metric-delta-base"
+                                                    >к {card.window.compare.short}</span
+                                                >{/if}</span
                                         >
                                     {/if}
                                 </span>
@@ -1873,7 +1956,10 @@
                                             <span
                                                 class="metric-delta"
                                                 class:negative={card.deltaProfit < 0}
-                                                >{formatDelta(card.deltaProfit)}</span
+                                                >{formatDelta(card.deltaProfit)}{#if card.window.compare}<span
+                                                        class="metric-delta-base"
+                                                        >к {card.window.compare.short}</span
+                                                    >{/if}</span
                                             >
                                         {/if}
                                     {:else}
@@ -3581,6 +3667,13 @@
 
     .metric-delta.negative {
         color: var(--error);
+    }
+
+    /* What the percentage is against: same size, quieter, so the change stays the loud half. */
+    .metric-delta-base {
+        margin-left: 4px;
+        font-weight: 500;
+        color: var(--text-muted);
     }
 
     /* A withheld figure: not zero, and not a colour that reads as one. */

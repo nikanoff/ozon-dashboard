@@ -102,6 +102,17 @@ describe('cardWindows', () => {
         expect(lastMonth.month).toBe('2026-09');
     });
 
+    it('names the comparison window short enough to sit beside a percentage', () => {
+        const windows = cardWindows(NOW);
+
+        // What the badge reads: «+62,9 % к 2 окт.» — the base is stated, not guessed at.
+        expect(windows.find((window) => window.key === 'yesterday')?.compare?.short).toBe('2 окт.');
+        expect(windows.find((window) => window.key === 'monthToDate')?.compare?.short).toBe(
+            '1–4 сент.'
+        );
+        expect(windows.find((window) => window.key === 'lastMonth')?.compare?.short).toBe('авг. 2026');
+    });
+
     it('keeps yesterday inside the previous month on the first day of a month', () => {
         const windows = cardWindows(new Date(2026, 9, 1, 9, 0, 0));
         const [today, yesterday, monthToDate, lastMonth] = windows;

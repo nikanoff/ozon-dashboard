@@ -1,6 +1,6 @@
 import type { AccrualDaySummary } from './accruals';
 import { costKey, type CostLookup } from './economics';
-import { dayKey, daysOfMonth, monthKey, monthLabel, previousMonthKey } from './period';
+import { dayKey, daysOfMonth, isValidMonthKey, monthKey, monthLabel, previousMonthKey } from './period';
 import {
     profitAfterTaxAndCost,
     taxableAmount,
@@ -43,7 +43,13 @@ export interface CardWindow {
     /** Inclusive `YYYY-MM-DD` edges. */
     from: string;
     to: string;
-    compare: { from: string; to: string; range: string } | null;
+    /**
+     * The window this one is measured against.
+     *
+     * `short` is for the percentage on the card: the badge says what it compares to («+62,9 %
+     * к 2 окт.»), because a change with no stated base is a number the reader has to guess at.
+     */
+    compare: { from: string; to: string; range: string; short: string } | null;
     /**
      * True when the window contains today.
      *
@@ -72,6 +78,42 @@ export function dayLabel(day: string): string {
         day: 'numeric',
         month: 'long'
     });
+}
+
+/**
+ * «2 окт.» — the same day, short enough to sit beside a percentage.
+ *
+ * A badge reads «+62,9 % к 2 окт.», and at that length the reader learns what the change is
+ * against without opening anything. The long form belongs in the breakdown, not next to the
+ * figure it qualifies.
+ */
+export function shortDayLabel(day: string): string {
+    const [year, month, date] = day.split('-').map(Number);
+    if (!year || !month || !date) return day;
+
+    return new Date(year, month - 1, date)
+        .toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
+        .replace(/\s*г\.$/, '')
+        .trim();
+}
+
+/** «авг. 2026» — a month, short enough for the same line. */
+export function shortMonthLabel(key: string): string {
+    if (!isValidMonthKey(key)) return key;
+
+    const [year, month] = key.split('-').map(Number);
+    return new Date(year, month - 1, 1)
+        .toLocaleDateString('ru-RU', { month: 'short', year: 'numeric' })
+        .replace(/\s*г\.$/, '')
+        .trim();
+}
+
+/** «1–4 сент.», or both months when the window crosses one. */
+export function shortRangeLabel(from: string, to: string): string {
+    if (from === to) return shortDayLabel(from);
+    if (from.slice(0, 7) === to.slice(0, 7)) return `${Number(from.slice(8))}–${shortDayLabel(to)}`;
+
+    return `${shortDayLabel(from)} — ${shortDayLabel(to)}`;
 }
 
 /** «1–4 октября», or both months spelled out when a window crosses one. */
@@ -131,7 +173,12 @@ export function cardWindows(now = new Date()): CardWindow[] {
             range: dayLabel(today),
             from: today,
             to: today,
-            compare: { from: yesterday, to: yesterday, range: dayLabel(yesterday) },
+            compare: {
+                from: yesterday,
+                to: yesterday,
+                range: dayLabel(yesterday),
+                short: shortDayLabel(yesterday)
+            },
             open: true,
             month: null
         },
@@ -141,7 +188,12 @@ export function cardWindows(now = new Date()): CardWindow[] {
             range: dayLabel(yesterday),
             from: yesterday,
             to: yesterday,
-            compare: { from: beforeYesterday, to: beforeYesterday, range: dayLabel(beforeYesterday) },
+            compare: {
+                from: beforeYesterday,
+                to: beforeYesterday,
+                range: dayLabel(beforeYesterday),
+                short: shortDayLabel(beforeYesterday)
+            },
             open: false,
             month: null
         },
@@ -154,7 +206,8 @@ export function cardWindows(now = new Date()): CardWindow[] {
             compare: {
                 from: `${previousMonth}-01`,
                 to: comparableEnd,
-                range: dayRangeLabel(`${previousMonth}-01`, comparableEnd)
+                range: dayRangeLabel(`${previousMonth}-01`, comparableEnd),
+                short: shortRangeLabel(`${previousMonth}-01`, comparableEnd)
             },
             open: true,
             month: currentMonth
@@ -168,7 +221,8 @@ export function cardWindows(now = new Date()): CardWindow[] {
             compare: {
                 from: `${monthBefore}-01`,
                 to: monthBeforeEnd,
-                range: monthLabel(monthBefore)
+                range: monthLabel(monthBefore),
+                short: shortMonthLabel(monthBefore)
             },
             open: false,
             month: previousMonth
