@@ -1980,6 +1980,300 @@
         </div>
     </section>
 
+    <section class="details-section">
+        <!--
+            No panel around this one. Every other section is a heading over its content, and a
+            boxed list read as a different kind of thing while its border and its 40 px of
+            padding were most of the empty space the cards were showing.
+        -->
+        <div class="bento-header">
+            <h2 class="section-title">Заказы FBO</h2>
+            <InfoTip
+                text="Десять последних заказов окна, по карточке на отправление. Цена — цена продавца, то есть деньги покупателя; стрелка показывает, сколько из неё остаётся продавцу после комиссии Ozon. Логистика, эквайринг и реклама сюда не входят: они приходят начислениями, и их видно в карточках «Сейчас» и в разделе «Месяц · деньги». Маршрут подсвечен, когда отправление едет между кластерами — по таким логистика дороже. Теги — механики Ozon, действовавшие на заказ."
+                label="Пояснение к списку заказов"
+            />
+            {#if paginatedPostings.length > 0}
+                <span class="section-note">
+                    {paginatedPostings.length} из {postingsData.length} заказов окна
+                </span>
+            {/if}
+            <div class="pagination">
+                <button
+                    class="btn-page"
+                    disabled={currentPage === 1}
+                    onclick={() => currentPage--}>Prev</button
+                >
+                <span class="page-info">Page {currentPage} of {totalPages || 1}</span>
+                <button
+                    class="btn-page"
+                    disabled={currentPage >= totalPages}
+                    onclick={() => currentPage++}>Next</button
+                >
+            </div>
+        </div>
+        <div class="order-list">
+            {#if $isLoading}
+                {#each Array(5) as _, index (index)}
+                    <div class="order-card skeleton-card">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-line short"></span>
+                    </div>
+                {/each}
+            {:else if paginatedPostings.length > 0}
+                {#each paginatedPostings as posting (posting.posting_number)}
+                    {@const rowMoney = rowMoneyByPosting.get(posting.posting_number)}
+                    <article class="order-card">
+                        <!--
+                            One header line, not two stacked blocks. The date, the status,
+                            payment and the route are four facts about the same order, and
+                            as separate rows they cost a third of the card's height while
+                            leaving most of its width empty.
+                        -->
+                        <header class="order-head">
+                            <span class="order-date">
+                                {new Date(posting.created_at).toLocaleString("ru-RU", {
+                                    day: "2-digit",
+                                    month: "2-digit",
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                })}
+                            </span>
+                            <span class="status-pill" data-status={posting.status}
+                                >{posting.status}</span
+                            >
+                            <span class="order-facts">
+                                <span class="fact">
+                                    <span class="fact-label">Оплата</span>
+                                    {posting.analytics_data?.payment_type_group_name || "—"}
+                                </span>
+                                <span class="fact">
+                                    <span class="fact-label">Маршрут</span>
+                                    <span
+                                        class="route-info"
+                                        class:is-cross-cluster={posting.financial_data
+                                            ?.cluster_from !==
+                                            posting.financial_data?.cluster_to}
+                                    >
+                                        <span
+                                            >{posting.financial_data?.cluster_from ||
+                                                "—"}</span
+                                        >
+                                        <span class="arrow-icon">→</span>
+                                        <span
+                                            >{posting.financial_data?.cluster_to || "—"}
+                                            <small class="meta-city"
+                                                >({posting.analytics_data?.city ||
+                                                    "—"})</small
+                                            ></span
+                                        >
+                                    </span>
+                                </span>
+                            </span>
+                        </header>
+
+                        <ul class="order-lines">
+                            {#each posting.products as product, i (`${product.sku || product.name}-${i}`)}
+                                <li class="order-line">
+                                    <div class="product-image-container small">
+                                        {#if $dashboardData?.skuToImage?.[product.sku]}
+                                            <img
+                                                src={$dashboardData.skuToImage[product.sku]}
+                                                alt={product.name}
+                                                class="product-thumb"
+                                                width="40"
+                                                height="40"
+                                                loading="lazy"
+                                                decoding="async"
+                                            />
+                                        {:else}
+                                            <div class="product-thumb-placeholder">
+                                                <svg
+                                                    viewBox="0 0 24 24"
+                                                    width="14"
+                                                    height="14"
+                                                    fill="none"
+                                                    stroke="currentColor"
+                                                    stroke-width="2"
+                                                    ><rect
+                                                        x="3"
+                                                        y="3"
+                                                        width="18"
+                                                        height="18"
+                                                        rx="2"
+                                                        ry="2"
+                                                    /><circle
+                                                        cx="8.5"
+                                                        cy="8.5"
+                                                        r="1.5"
+                                                    /><polyline points="21 15 16 10 5 21" /></svg
+                                                >
+                                            </div>
+                                        {/if}
+                                    </div>
+
+                                    <div class="line-body">
+                                        <!--
+                                            The article on the left, its money on the right
+                                            of the same line: two lines per product instead
+                                            of four, which is what the card spent its height
+                                            on.
+                                        -->
+                                        <div class="line-top">
+                                            <a
+                                                href="/stocks?highlight={product.sku}"
+                                                class="product-link"
+                                            >
+                                                {product.name}
+                                            </a>
+                                            {#if rowMoney?.[i]?.payout != null}
+                                                <span class="line-money">
+                                                    <span class="money-gross"
+                                                        >{formatCurrency(rowMoney[i].gross)}</span
+                                                    >
+                                                    <span class="money-arrow" aria-hidden="true"
+                                                        >→</span
+                                                    >
+                                                    <span class="money-net"
+                                                        >{formatCurrency(
+                                                            rowMoney[i].payout ?? 0,
+                                                        )}</span
+                                                    >
+                                                </span>
+                                            {:else}
+                                                <span class="line-money">
+                                                    <span class="money-net"
+                                                        >{formatCurrency(
+                                                            productUnitPrice(product) *
+                                                                (product.quantity || 1),
+                                                        )}</span
+                                                    >
+                                                </span>
+                                            {/if}
+                                        </div>
+                                        <div class="line-sub">
+                                            <span>SKU {product.sku}</span>
+                                            {#if rowMoney?.[i]?.payout != null}
+                                                <span class="line-dot" aria-hidden="true">·</span>
+                                                <span
+                                                    >комиссия
+                                                    {formatCurrency(
+                                                        rowMoney[i].commission ?? 0,
+                                                    )}{rowMoney[i].commissionPercent != null
+                                                        ? ` · ${formatPercent(rowMoney[i].commissionPercent ?? 0)}`
+                                                        : ""}</span
+                                                >
+                                            {:else}
+                                                <span class="line-dot" aria-hidden="true">·</span>
+                                                <span>Ozon не отдал суммы по этой строке</span>
+                                            {/if}
+                                        </div>
+                                    </div>
+                                </li>
+                            {/each}
+                        </ul>
+
+                        <!-- Pills only: the label above them said what they already say. -->
+                        <div class="order-tags">
+                            {#if posting.actions.length > 0}
+                                {#each posting.actions as action}
+                                    <span class="action-tag">{action}</span>
+                                {/each}
+                            {:else}
+                                <span class="no-actions">без тегов</span>
+                            {/if}
+                        </div>
+                    </article>
+                {/each}
+            {:else}
+                <div class="order-empty">За этот период заказов нет.</div>
+            {/if}
+        </div>
+    </section>
+
+    <section class="insights-section">
+        <div class="bento-header">
+            <h2 class="section-title">Склад · остатки по товарам</h2>
+            <InfoTip
+                text="Сопоставление продаж за 14 дней с текущими остатками. «Продаж/день» — средний спрос в штуках, «Хватит на» — на сколько дней хватит склада при этом темпе (запас в днях). «Запас в закупке» — это оборотный капитал по вашей себестоимости, а не по цене продажи; рядом для сравнения та же полка в ценах продажи. «Оборачиваемость» и запас в днях считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним: при ровном складе это близко к среднему."
+                label="Пояснение к остаткам и оборачиваемости"
+            />
+        </div>
+
+        {#if stocksLoadingNow}
+            <div class="kpi-strip" aria-hidden="true">
+                {#each [1, 2, 3, 4, 5] as chip (chip)}
+                    <div class="kpi-chip glass-panel">
+                        <span class="skeleton sk-line"></span>
+                        <span class="skeleton sk-chip"></span>
+                    </div>
+                {/each}
+            </div>
+        {:else if stocksFailed}
+            <div class="panel glass-panel state-note" role="alert">
+                <p>Остатки загрузить не удалось: {stocksLoadError}</p>
+                <button
+                    type="button"
+                    class="btn-retry"
+                    onclick={() => mutateStocks({ force: true })}
+                >
+                    Повторить
+                </button>
+            </div>
+        {:else if stocksEmpty}
+            <div class="panel glass-panel state-note">
+                <p>Остатков нет: Ozon не вернул ни одной строки FBO.</p>
+            </div>
+        {:else}
+            <div class="kpi-strip">
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">На складе, шт</span>
+                    <span class="kpi-value">{formatNumber(inventory.totalPresent)}</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">В резерве, шт</span>
+                    <span class="kpi-value">{formatNumber(inventory.totalReserved)}</span>
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Стоимость остатков</span>
+                    <span class="kpi-value">{formatCurrency(inventory.inventoryValue)}</span>
+                </div>
+                <!--
+                    Moved here from the capital section: they describe the same stock the table
+                    below lists, and a reader who wants to know what is lying in the warehouse
+                    should not have to look in two places for its cost and its speed.
+                -->
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Запас в закупке</span>
+                    <span class="kpi-value"
+                        >{capital.stockAtCost === null
+                            ? "—"
+                            : formatCurrency(capital.stockAtCost)}</span
+                    >
+                    <span class="kpi-delta"
+                        >в ценах продажи
+                        {formatCurrency(capital.stockAtRetail)}
+                        {capital.costedShare < 1
+                            ? ` · себестоимость известна для ${formatPercent(capital.costedShare * 100, 0)} запаса`
+                            : ""}</span
+                    >
+                </div>
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Оборачиваемость</span>
+                    <span class="kpi-value"
+                        >{capital.turnoverRatio === null
+                            ? "—"
+                            : `${capital.turnoverRatio.toFixed(2).replace(".", ",")}×`}</span
+                    >
+                    <span class="kpi-delta"
+                        >{capital.daysOfStock === null
+                            ? "нужна полная себестоимость"
+                            : `запас на ${Math.round(capital.daysOfStock)} дн.`}</span
+                    >
+                </div>
+            </div>
+        {/if}
+    </section>
+
     {#if periodIsPartial}
         <div class="panel glass-panel state-note" role="status">
             <p>
@@ -2766,286 +3060,10 @@
     </section>
 
 
-    <section class="insights-section">
-        <div class="bento-header">
-            <h2 class="section-title">Склад · остатки по товарам</h2>
-            <InfoTip
-                text="Сопоставление продаж за 14 дней с текущими остатками. «Продаж/день» — средний спрос в штуках, «Хватит на» — на сколько дней хватит склада при этом темпе (запас в днях). «Запас в закупке» — это оборотный капитал по вашей себестоимости, а не по цене продажи; рядом для сравнения та же полка в ценах продажи. «Оборачиваемость» и запас в днях считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним: при ровном складе это близко к среднему."
-                label="Пояснение к остаткам и оборачиваемости"
-            />
-        </div>
-
-        {#if stocksLoadingNow}
-            <div class="kpi-strip" aria-hidden="true">
-                {#each [1, 2, 3, 4, 5] as chip (chip)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            </div>
-        {:else if stocksFailed}
-            <div class="panel glass-panel state-note" role="alert">
-                <p>Остатки загрузить не удалось: {stocksLoadError}</p>
-                <button
-                    type="button"
-                    class="btn-retry"
-                    onclick={() => mutateStocks({ force: true })}
-                >
-                    Повторить
-                </button>
-            </div>
-        {:else if stocksEmpty}
-            <div class="panel glass-panel state-note">
-                <p>Остатков нет: Ozon не вернул ни одной строки FBO.</p>
-            </div>
-        {:else}
-            <div class="kpi-strip">
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">На складе, шт</span>
-                    <span class="kpi-value">{formatNumber(inventory.totalPresent)}</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">В резерве, шт</span>
-                    <span class="kpi-value">{formatNumber(inventory.totalReserved)}</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Стоимость остатков</span>
-                    <span class="kpi-value">{formatCurrency(inventory.inventoryValue)}</span>
-                </div>
-                <!--
-                    Moved here from the capital section: they describe the same stock the table
-                    below lists, and a reader who wants to know what is lying in the warehouse
-                    should not have to look in two places for its cost and its speed.
-                -->
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Запас в закупке</span>
-                    <span class="kpi-value"
-                        >{capital.stockAtCost === null
-                            ? "—"
-                            : formatCurrency(capital.stockAtCost)}</span
-                    >
-                    <span class="kpi-delta"
-                        >в ценах продажи
-                        {formatCurrency(capital.stockAtRetail)}
-                        {capital.costedShare < 1
-                            ? ` · себестоимость известна для ${formatPercent(capital.costedShare * 100, 0)} запаса`
-                            : ""}</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Оборачиваемость</span>
-                    <span class="kpi-value"
-                        >{capital.turnoverRatio === null
-                            ? "—"
-                            : `${capital.turnoverRatio.toFixed(2).replace(".", ",")}×`}</span
-                    >
-                    <span class="kpi-delta"
-                        >{capital.daysOfStock === null
-                            ? "нужна полная себестоимость"
-                            : `запас на ${Math.round(capital.daysOfStock)} дн.`}</span
-                    >
-                </div>
-            </div>
-        {/if}
-    </section>
+    
 
 
-    <section class="details-section">
-        <div class="card glass full-width">
-            <div class="section-header">
-                <h2>Заказы FBO</h2>
-                <div class="pagination">
-                    <button
-                        class="btn-page"
-                        disabled={currentPage === 1}
-                        onclick={() => currentPage--}>Prev</button
-                    >
-                    <span class="page-info"
-                        >Page {currentPage} of {totalPages || 1}</span
-                    >
-                    <button
-                        class="btn-page"
-                        disabled={currentPage >= totalPages}
-                        onclick={() => currentPage++}>Next</button
-                    >
-                </div>
-            </div>
-            <div class="order-list">
-                {#if $isLoading}
-                    {#each Array(5) as _, index (index)}
-                        <div class="order-card skeleton-card">
-                            <span class="skeleton sk-line"></span>
-                            <span class="skeleton sk-line short"></span>
-                        </div>
-                    {/each}
-                {:else if paginatedPostings.length > 0}
-                    {#each paginatedPostings as posting (posting.posting_number)}
-                        {@const rowMoney = rowMoneyByPosting.get(posting.posting_number)}
-                        <article class="order-card">
-                            <header class="order-head">
-                                <span class="order-date">
-                                    {new Date(posting.created_at).toLocaleString("ru-RU", {
-                                        day: "2-digit",
-                                        month: "2-digit",
-                                        hour: "2-digit",
-                                        minute: "2-digit",
-                                    })}
-                                </span>
-                                <span class="status-pill" data-status={posting.status}
-                                    >{posting.status}</span
-                                >
-                            </header>
 
-                            <ul class="order-lines">
-                                {#each posting.products as product, i (`${product.sku || product.name}-${i}`)}
-                                    <li class="order-line">
-                                        <div class="product-image-container small">
-                                            {#if $dashboardData?.skuToImage?.[product.sku]}
-                                                <img
-                                                    src={$dashboardData.skuToImage[product.sku]}
-                                                    alt={product.name}
-                                                    class="product-thumb"
-                                                    width="48"
-                                                    height="48"
-                                                    loading="lazy"
-                                                    decoding="async"
-                                                />
-                                            {:else}
-                                                <div class="product-thumb-placeholder">
-                                                    <svg
-                                                        viewBox="0 0 24 24"
-                                                        width="14"
-                                                        height="14"
-                                                        fill="none"
-                                                        stroke="currentColor"
-                                                        stroke-width="2"
-                                                        ><rect
-                                                            x="3"
-                                                            y="3"
-                                                            width="18"
-                                                            height="18"
-                                                            rx="2"
-                                                            ry="2"
-                                                        /><circle
-                                                            cx="8.5"
-                                                            cy="8.5"
-                                                            r="1.5"
-                                                        /><polyline points="21 15 16 10 5 21" /></svg
-                                                    >
-                                                </div>
-                                            {/if}
-                                        </div>
-
-                                        <div class="line-body">
-                                            <a
-                                                href="/stocks?highlight={product.sku}"
-                                                class="product-link"
-                                            >
-                                                {product.name}
-                                            </a>
-                                            <div class="id-label">SKU: {product.sku}</div>
-
-                                            {#if rowMoney?.[i]?.payout != null}
-                                                <div class="line-money">
-                                                    <span class="money-gross"
-                                                        >{formatCurrency(rowMoney[i].gross)}</span
-                                                    >
-                                                    <span class="money-arrow" aria-hidden="true"
-                                                        >→</span
-                                                    >
-                                                    <span class="money-net"
-                                                        >{formatCurrency(
-                                                            rowMoney[i].payout ?? 0,
-                                                        )}</span
-                                                    >
-                                                </div>
-                                                <div class="id-label">
-                                                    комиссия
-                                                    {formatCurrency(
-                                                        rowMoney[i].commission ?? 0,
-                                                    )}{rowMoney[i].commissionPercent != null
-                                                        ? ` · ${formatPercent(rowMoney[i].commissionPercent ?? 0)}`
-                                                        : ""}
-                                                </div>
-                                            {:else}
-                                                <div class="line-money">
-                                                    <span class="money-net"
-                                                        >{formatCurrency(
-                                                            productUnitPrice(product) *
-                                                                (product.quantity || 1),
-                                                        )}</span
-                                                    >
-                                                </div>
-                                                <div class="id-label">
-                                                    Ozon не отдал суммы по этой строке
-                                                </div>
-                                            {/if}
-                                        </div>
-                                    </li>
-                                {/each}
-                            </ul>
-
-                            <dl class="order-meta">
-                                <div class="meta-item">
-                                    <dt>Оплата</dt>
-                                    <dd>
-                                        {posting.analytics_data?.payment_type_group_name || "—"}
-                                    </dd>
-                                </div>
-                                <div class="meta-item">
-                                    <dt>Маршрут</dt>
-                                    <dd>
-                                        <div
-                                            class="route-info"
-                                            class:is-cross-cluster={posting.financial_data
-                                                ?.cluster_from !==
-                                                posting.financial_data?.cluster_to}
-                                        >
-                                            <span
-                                                >{posting.financial_data?.cluster_from ||
-                                                    "—"}</span
-                                            >
-                                            <span class="arrow-icon">→</span>
-                                            <span
-                                                >{posting.financial_data?.cluster_to || "—"}
-                                                <small class="meta-city"
-                                                    >({posting.analytics_data?.city ||
-                                                        "—"})</small
-                                                ></span
-                                            >
-                                        </div>
-                                    </dd>
-                                </div>
-                            </dl>
-
-                            <!--
-                                Tags get their own row rather than a third column. A posting
-                                carries up to six of them and they stacked vertically inside a
-                                narrow cell, which made one column six rows tall while the
-                                other two held a single line each — the imbalance the card was
-                                showing. Full width, they wrap into two rows at most.
-                            -->
-                            <div class="order-tags">
-                                <span class="tags-label">Теги</span>
-                                <div class="tags-list">
-                                    {#if posting.actions.length > 0}
-                                        {#each posting.actions as action}
-                                            <span class="action-tag">{action}</span>
-                                        {/each}
-                                    {:else}
-                                        <span class="no-actions">—</span>
-                                    {/if}
-                                </div>
-                            </div>
-                        </article>
-                    {/each}
-                {:else}
-                    <div class="order-empty">За этот период заказов нет.</div>
-                {/if}
-            </div>
-        </div>
-    </section>
     {/if}
 
     {#if showCogs}
@@ -3111,10 +3129,10 @@
     }
 
     .action-tag {
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         background: transparent;
         color: var(--text-secondary);
-        padding: 0.15rem 0.4rem;
+        padding: 0.1rem 0.35rem;
         border-radius: var(--radius-sm);
         border: 1px solid var(--border-subtle);
         line-height: 1.2;
@@ -3125,24 +3143,9 @@
         font-size: 0.8125rem;
     }
 
-    .card {
-        background: var(--bg-card);
-        padding: var(--space-xl);
-        border: 1px solid var(--border-subtle);
-        border-radius: var(--radius-md);
-        display: flex;
-        gap: var(--space-lg);
-        align-items: center;
-        transition: all 0.3s ease;
-    }
-
-    .glass {
-        background: transparent;
-    }
-
-    .details-section .full-width {
-        flex-direction: column;
-        align-items: stretch;
+    /* The orders list needs the section rhythm, not a panel of its own. */
+    .details-section {
+        margin-bottom: var(--space-xxl);
     }
 
     .pagination {
@@ -3266,22 +3269,12 @@
         opacity: 0.8;
     }
 
-    .section-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: var(--space-md);
-        flex-wrap: wrap;
-        margin-bottom: var(--space-lg);
-    }
-
-    .section-header h2 {
-        font-family: var(--font-heading);
-        margin: 0;
-        font-size: 1.25rem;
-        font-weight: 600;
-        letter-spacing: 0.05em;
-        opacity: 0.9;
+    /* How much of the window this page is showing; the pager keeps the right edge. */
+    .section-note {
+        margin-left: var(--space-sm);
+        margin-right: auto;
+        font-size: 0.75rem;
+        color: var(--text-muted);
     }
 
     /*
@@ -3291,27 +3284,33 @@
         pairs wraps instead, and every field the table carried is still here.
     */
     .order-list {
-        display: flex;
-        flex-direction: column;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr));
         gap: var(--space-sm);
     }
 
     .order-card {
         display: flex;
         flex-direction: column;
-        gap: var(--space-sm);
-        padding: var(--space-md);
+        gap: 6px;
+        padding: 10px 12px;
         border: 1px solid var(--border-subtle);
         border-radius: var(--radius-md);
         background: var(--bg-card);
     }
 
+    /*
+        Date, status, payment and route on one wrapping line. As four stacked rows they cost a
+        third of the card's height and left most of its width empty; on one line the card reads
+        as a record rather than as a form.
+    */
     .order-head {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
-        justify-content: space-between;
-        gap: var(--space-sm);
+        gap: 4px 10px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--border-subtle);
     }
 
     .order-date {
@@ -3332,8 +3331,8 @@
 
     .order-line {
         display: flex;
-        gap: var(--space-sm);
-        align-items: flex-start;
+        gap: 8px;
+        align-items: center;
         min-width: 0;
     }
 
@@ -3350,67 +3349,68 @@
         overflow-wrap: anywhere;
     }
 
+    /* The article on the left, its money on the right of the same line. */
+    .line-top {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        min-width: 0;
+    }
+
     .line-money {
         display: flex;
         flex-wrap: wrap;
         align-items: baseline;
-        gap: 6px;
-        margin-top: 2px;
+        gap: 5px;
+        flex-shrink: 0;
         font-variant-numeric: tabular-nums;
     }
 
-    /*
-        Two columns, not three: payment and route are one line each, so the pair splits the
-        row evenly and the card keeps its shape whatever a posting carries.
-    */
-    .order-meta {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
-        gap: var(--space-sm) var(--space-lg);
-        margin: 0;
-        padding-top: var(--space-sm);
-        border-top: 1px solid var(--border-subtle);
+    /* SKU and commission: one muted line under the article, not two more paragraphs. */
+    .line-sub {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 4px;
+        font-size: 0.72rem;
+        color: var(--text-muted);
+    }
+
+    .line-dot {
+        opacity: 0.6;
+    }
+
+    /* Pushed to the right of the header, so the card's width carries information. */
+    .order-facts {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 14px;
+        margin-left: auto;
+    }
+
+    .fact {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 5px;
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+    }
+
+    .fact-label {
+        font-size: var(--text-xs);
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
     }
 
     .order-tags {
         display: flex;
-        flex-direction: column;
-        gap: 2px;
-        margin-top: var(--space-sm);
-        padding-top: var(--space-sm);
-        border-top: 1px solid var(--border-subtle);
-    }
-
-    .tags-label {
-        font-size: var(--text-xs);
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-    }
-
-    /* Wrapping chips rather than a stack, so six tags cost two rows and not six. */
-    .tags-list {
-        display: flex;
         flex-wrap: wrap;
-        gap: 6px;
-    }
-
-    .meta-item {
-        min-width: 0;
-    }
-
-    .meta-item dt {
-        font-size: var(--text-xs);
-        color: var(--text-muted);
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        margin-bottom: 2px;
-    }
-
-    .meta-item dd {
-        margin: 0;
-        font-size: var(--text-sm);
-        color: var(--text-secondary);
+        gap: 4px;
+        padding-top: 6px;
+        border-top: 1px solid var(--border-subtle);
     }
 
     .meta-city {
@@ -3703,8 +3703,8 @@
     }
 
     .product-image-container.small {
-        width: 48px;
-        height: 48px;
+        width: 40px;
+        height: 40px;
     }
 
     .product-thumb {
@@ -3716,12 +3716,6 @@
     .product-thumb-placeholder {
         color: var(--text-muted);
         opacity: 0.3;
-    }
-
-    .id-label {
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        margin-top: 2px;
     }
 
     /* --- Analytics insights (tiers 1-4) --- */
@@ -4226,8 +4220,7 @@
             margin-bottom: var(--space-xl);
         }
 
-        .section-title,
-        .section-header h2 {
+        .section-title {
             font-size: 1.05rem;
         }
 
@@ -4262,10 +4255,6 @@
             gap: 3px;
         }
 
-
-        .section-header {
-            align-items: flex-start;
-        }
     }
 
     /* --- Loading, empty and error states --- */
