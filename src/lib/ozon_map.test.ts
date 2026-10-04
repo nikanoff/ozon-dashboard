@@ -157,6 +157,35 @@ describe('image maps', () => {
         expect(map).toEqual({ 1: 'primary.jpg', 2: 'fallback.jpg', 3: '' });
     });
 
+    it('reads the live array shape of primary_image', () => {
+        const map = buildSkuImageMap([
+            { sku: 1, primary_image: ['live.jpg'], images: ['other.jpg'] },
+            // An empty list is what the live method sends when there is no picture at all.
+            { sku: 2, primary_image: [], images: ['fallback.jpg'] },
+            { sku: 3, primary_image: [] }
+        ]);
+
+        expect(map).toEqual({ 1: 'live.jpg', 2: 'fallback.jpg', 3: '' });
+    });
+
+    it('pins the per-region CDN mirror to the canonical host', () => {
+        // Measured: a Russian address gets ir.ozone.ru, the deployment's region gets
+        // ir-20.ozone.ru — a host whose address times out, which is what broke every picture
+        // on the deployed site while the same code worked in development.
+        const map = buildSkuImageMap([
+            { sku: 1, primary_image: ['https://ir-20.ozone.ru/s3/multimedia-1-c/9297326964.jpg'] },
+            { sku: 2, primary_image: ['https://ir.ozone.ru/s3/multimedia-1-c/7524750548.jpg'] },
+            // Anything that is not an Ozon mirror is left exactly as it came.
+            { sku: 3, primary_image: ['https://cdn.example.com/a.jpg'] }
+        ]);
+
+        expect(map).toEqual({
+            1: 'https://ir.ozone.ru/s3/multimedia-1-c/9297326964.jpg',
+            2: 'https://ir.ozone.ru/s3/multimedia-1-c/7524750548.jpg',
+            3: 'https://cdn.example.com/a.jpg'
+        });
+    });
+
     it('keys product pictures by id', () => {
         const map = buildProductImageMap([
             { product_id: 10, primary_photo: ['p.jpg'], photo: ['x.jpg'] },
@@ -165,5 +194,17 @@ describe('image maps', () => {
         ]);
 
         expect(map).toEqual({ 10: 'p.jpg', 11: 'fallback.jpg', 12: '' });
+    });
+
+    it('pins the mirror on the inventory map too', () => {
+        const map = buildProductImageMap([
+            { product_id: 10, primary_photo: ['https://ir-3.ozone.ru/s3/x.jpg'] },
+            { product_id: 11, photo: ['https://ir-20.ozone.ru/s3/y.jpg'] }
+        ]);
+
+        expect(map).toEqual({
+            10: 'https://ir.ozone.ru/s3/x.jpg',
+            11: 'https://ir.ozone.ru/s3/y.jpg'
+        });
     });
 });

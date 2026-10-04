@@ -77,13 +77,47 @@ export function toStockRow(item: OzonStockItem): StockRow {
     };
 }
 
+/**
+ * Ozon answers with one of several CDN mirrors, chosen by where the request came from.
+ *
+ * Verified against the live account: the same call returned `ir.ozone.ru` from a Russian
+ * address and `ir-20.ozone.ru` from the region the deployment runs in — and that host does not
+ * answer at all (its address times out; `ir-1` does not even resolve). So every product picture
+ * on the deployed site was a broken image while the identical code served working ones in
+ * development, which is a difference no amount of reading the front end would explain.
+ *
+ * The mirrors are the same CDN, so the host is pinned to the canonical one. That also makes the
+ * payload stable: the same product yields the same URL wherever the function happens to run.
+ */
+export function canonicalImageUrl(value: unknown): string {
+    const url = firstUrl(value);
+    if (!url) return '';
+
+    return url.replace(/^https?:\/\/ir-\d+\.ozone\.ru\//, 'https://ir.ozone.ru/');
+}
+
+/**
+ * The first usable URL in a value that may be a string or a list of them.
+ *
+ * The live shape of `primary_image` is an **array**; the documentation shows a string. Taking
+ * the value as-is put an array into the payload, where it only worked because a one-element
+ * array stringifies to its element — a coincidence, not a contract.
+ */
+function firstUrl(value: unknown): string {
+    if (typeof value === 'string') return value.trim();
+    if (!Array.isArray(value)) return '';
+
+    const first = value.find((entry) => typeof entry === 'string' && entry.trim() !== '');
+    return typeof first === 'string' ? first.trim() : '';
+}
+
 /** SKU -> primary image URL, used by the orders table. */
 export function buildSkuImageMap(items: OzonProductInfo[]): Record<number, string> {
     const map: Record<number, string> = {};
 
     for (const item of items) {
         if (item.sku) {
-            map[item.sku] = item.primary_image || item.images?.[0] || '';
+            map[item.sku] = canonicalImageUrl(item.primary_image) || canonicalImageUrl(item.images);
         }
     }
 
@@ -99,7 +133,7 @@ export function buildProductImageMap(
     for (const item of items) {
         if (item.product_id !== undefined) {
             map[String(item.product_id)] =
-                item.primary_photo?.[0] || item.photo?.[0] || '';
+                canonicalImageUrl(item.primary_photo) || canonicalImageUrl(item.photo);
         }
     }
 

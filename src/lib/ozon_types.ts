@@ -116,7 +116,15 @@ export interface OzonProductInfo {
     sku: number;
     name?: string;
     offer_id?: string;
-    primary_image?: string;
+    /**
+     * Live responses return an **array** of URLs here; the documentation shows a string.
+     *
+     * Both shapes are accepted and reduced to a single URL by `buildSkuImageMap`. The deployed
+     * function also receives a per-region CDN mirror in this field — `ir-20.ozone.ru` from
+     * Frankfurt against `ir.ozone.ru` from a Russian address — which does not answer, so the
+     * host is pinned to the canonical one there.
+     */
+    primary_image?: string | string[];
     images?: string[];
 }
 
