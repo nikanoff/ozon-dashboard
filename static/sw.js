@@ -14,7 +14,7 @@
  * confusing for everything else. Raising this makes `activate` drop the old caches, so the
  * next fetch goes to the network.
  */
-const VERSION = "v2";
+const VERSION = "v3";
 const STATIC_CACHE = `ozon-static-${VERSION}`;
 const PAGE_CACHE = `ozon-pages-${VERSION}`;
 
