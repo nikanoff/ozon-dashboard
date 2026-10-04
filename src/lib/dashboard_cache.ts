@@ -1,4 +1,4 @@
-import type { DashboardPayload, DashboardPosting } from './ozon_types';
+import type { DashboardPayload, DashboardPosting, OzonReturn } from './ozon_types';
 
 /**
  * Incremental refresh.
@@ -83,6 +83,32 @@ export function mergeDashboardPayload(
         oldestAllowed: fresh.oldestAllowed,
         // The ranges the fresh request covered: what the merged payload can now be said to
         // hold. A merged payload keeps the older rows, but only within these edges.
-        ranges: fresh.ranges ?? previous.ranges
+        ranges: fresh.ranges ?? previous.ranges,
+        returns: mergeReturns(previous, fresh),
+        returnsWindow: fresh.returnsWindow ?? previous.returnsWindow
     };
+}
+
+/**
+ * Returns for the merged payload: the fresh window wins, older rows are kept.
+ *
+ * Keyed by the return's own identifier rather than by date, because a refresh re-reads the
+ * whole previous month as well — the cards need it — and a date-keyed merge would either
+ * duplicate those rows or drop the ones a return's date moved out of.
+ */
+function mergeReturns(previous: DashboardPayload, fresh: DashboardPayload): OzonReturn[] {
+    // A payload from an older build carries no returns at all: keeping the fresh ones is
+    // the whole answer, and the cards show a gap for the months it never had.
+    if (!fresh.returns) return previous.returns ?? [];
+
+    const freshFrom = fresh.returnsWindow?.from;
+    const byId = new Map<number, OzonReturn>();
+
+    for (const row of previous.returns ?? []) {
+        if (freshFrom && row.date >= freshFrom) continue;
+        byId.set(row.id, row);
+    }
+    for (const row of fresh.returns) byId.set(row.id, row);
+
+    return [...byId.values()].sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
 }

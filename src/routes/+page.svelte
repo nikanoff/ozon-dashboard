@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { getDashboardData, getStocksData, getEconomicsData, getMonthFinance } from "$lib/ozon_api";
+    import { getDashboardData, getStocksData, getEconomicsData, getMonthFinance, getMonthRealization } from "$lib/ozon_api";
     import {
         cachedWindow,
         daysToFetch,
@@ -13,9 +13,29 @@
         daysOfMonth,
         isInsidePeriod,
         lastCompleteMonth,
+        monthKey,
         monthLabel,
         previousMonthKey,
     } from "$lib/period";
+    import {
+        accrualTotals,
+        cardAccrualDays,
+        cardProfit,
+        cardReturnsWindow,
+        cardWindows,
+        costOfGoods,
+        daysBetween,
+        deltaPercent,
+        ordersTotals,
+        realizationCost,
+        returnsTotals,
+        type AccrualTotals,
+        type CardProfit,
+        type CogsTotals,
+        type OrdersTotals,
+        type ReturnsTotals,
+    } from "$lib/period_cards";
+    import { MAX_ACCRUAL_DAYS } from "$lib/accruals";
     import {
         mergeCostCandidates,
         monthBounds,
@@ -39,20 +59,12 @@
     import type { DashboardPayload } from "$lib/ozon_types";
     import { peekCache, useSWR } from "$lib/swr";
     import { refreshOnKeysChange } from "$lib/refresh_on_keys";
-    import {
-        averageOrderValue,
-        averageUnitPrice,
-        calculateStats,
-        cancellationRate,
-        productUnitPrice,
-        unitsPerOrder,
-    } from "$lib/stats";
+    import { calculateStats, productUnitPrice } from "$lib/stats";
     import {
         actionBreakdown,
         byCity,
         byPaymentType,
         clusterRoutes,
-        compareWindows,
         dailyTrend,
         hourlyActivity,
         promoShare,
@@ -60,13 +72,19 @@
         topProducts,
     } from "$lib/metrics";
     import { inventoryInsights } from "$lib/inventory";
-    import { enrichLines, costBookLookup, costKey, skuEconomics, abcAnalysis, breakEvenPrice, lossMaking, commissionSpread } from "$lib/economics";
+    import {
+        enrichLines,
+        costBookLookup,
+        costKey,
+        skuEconomics,
+    } from "$lib/economics";
     import { capitalSummary } from "$lib/capital";
     import { costBook } from "$lib/stores/cogs";
     import CogsPanel from "$lib/components/CogsPanel.svelte";
     import {
         formatCurrency,
         formatCurrencyParts,
+        formatCurrencyPrecise,
         formatDay,
         formatDelta,
         formatNumber,
@@ -75,6 +93,7 @@
     import { ozonKeys } from "$lib/stores/ozon_keys";
     import OzonHeader from "$lib/components/OzonHeader.svelte";
     import InfoTip from "$lib/components/InfoTip.svelte";
+    import MetricTip from "$lib/components/MetricTip.svelte";
     import { get } from "svelte/store";
     import { onDestroy } from "svelte";
     import { describeFailure } from "$lib/failures";
@@ -139,6 +158,26 @@
         return monthEnd !== undefined && monthEnd < tomorrow ? monthEnd : undefined;
     });
 
+    /**
+     * The period cards' own month: the calendar month before today.
+     *
+     * The cards are anchored to today — today, yesterday, the month so far, and the month that
+     * closed — so three of their windows sit inside the recent tail the endpoint always walks.
+     * The fourth is the previous calendar month, and it falls outside both other ranges the
+     * moment an older month is selected: a 31-day tail starting on 3 September holds two days
+     * of it less than it needs. Stating the month explicitly is what closes that gap, and it
+     * is also where the returns feed starts.
+     */
+    const cardWindow = $derived.by(() => {
+        const month = previousMonthKey(monthKey(new Date()));
+        const days = daysOfMonth(month);
+
+        return { from: `${month}-01`, to: days[days.length - 1] ?? `${month}-01` };
+    });
+
+    /** That month as `YYYY-MM`, which is how the realization report is asked for. */
+    const cardMonth = $derived(cardWindow.from.slice(0, 7));
+
     const swrResult = useSWR(
         // Account-scoped key. The key itself is fixed for the lifetime of this
         // component, so `refreshOnKeysChange` below resets both requests: that is
@@ -170,13 +209,13 @@
                 // that window and folds it into what is already on screen.
                 return mergeDashboardPayload(
                     previous,
-                    await getDashboardData(signal, refreshSince(), windowFrom, windowTo),
+                    await getDashboardData(signal, refreshSince(), windowFrom, windowTo, cardWindow),
                 );
             }
 
             // The endpoint walks Ozon's cursors server-side and returns only the
             // fields the table renders, so the browser makes a single request.
-            return getDashboardData(signal, windowFrom, windowFrom, windowTo);
+            return getDashboardData(signal, windowFrom, windowFrom, windowTo, cardWindow);
         },
         // The 31-day figures change slowly, so a minute was far too eager.
         { dedupingInterval: 2000, refreshInterval: 5 * 60 * 1000 },
@@ -220,9 +259,8 @@
     // --- The financial layer: accruals, the money that actually arrives ---
     //
     // `/v1/finance/accrual/by-day` answers for one day at a time, so the window is
-    // fetched once and kept in localStorage. Closed days never change, so later visits
-    // ask only for the two trailing days instead of walking all 31 again.
-    const FINANCE_WINDOW_DAYS = 31;
+    // fetched once and kept in localStorage. Closed days never change, so later visits ask
+    // only for the two trailing days instead of walking the whole window again.
 
     // Order-derived state first: everything below builds on it.
     const postingsData = $derived($dashboardData?.postings ?? []);
@@ -248,9 +286,11 @@
     const previousPeriodDayList = $derived(daysOfMonth(previousMonth));
     const previousLabel = $derived(monthLabel(previousMonth));
     // Accruals are fetched for both months at once; the endpoint caps the request at 62 days,
-    // which is exactly two months, so the comparison costs nothing extra to keep fresh.
+    // which is exactly two months, so the comparison costs nothing extra to keep fresh. The
+    // period cards add their own two months — the one that closed and the one running — and
+    // the union is what gets fetched and kept.
     const financeFetchDays = $derived(
-        [...new Set([...periodDayList, ...previousPeriodDayList])].sort(),
+        [...new Set([...periodDayList, ...previousPeriodDayList, ...cardAccrualDays()])].sort(),
     );
     // Months come from the calendar, not from the loaded orders: the point of the month mode
     // is to reach periods the order feed cannot cover, and the realization report answers for
@@ -314,6 +354,23 @@
         }
     }
 
+    /**
+     * Splits the days to fetch into requests the accrual endpoint accepts.
+     *
+     * It keeps the tail of a list longer than 62 days, and a silently dropped month would read
+     * as a period Ozon accrued nothing for — the exact failure the accrual layer exists to
+     * prevent. Chunking keeps every requested day requested.
+     */
+    function chunkDays(days: string[], size: number): string[][] {
+        const chunks: string[][] = [];
+
+        for (let index = 0; index < days.length; index += size) {
+            chunks.push(days.slice(index, index + size));
+        }
+
+        return chunks;
+    }
+
     const economicsResult = useSWR(
         `ozon-economics:${clientId}`,
         async (signal) => {
@@ -332,16 +389,26 @@
 
             if (missing.length === 0 && !needsTypes) return cache;
 
-            const payload = await getEconomicsData(signal, missing, needsTypes);
-            const merged = pruneAccrualCache(
-                mergeAccrualDays(cache, payload.days, payload.types, payload.fetchedAt),
-                // The selected month and the one before it: the comparison needs both, and
-                // dropping either would cost a fresh round of requests on every switch.
-                financeFetchDays,
+            // The endpoint keeps only the last 62 days of a longer list, so a wider union is
+            // split into requests of its own size rather than silently truncated: a dropped
+            // day would read as a period with no accruals at all. Two requests at most — the
+            // union is the selected month, the month before it, and the cards' two months.
+            const chunks = chunkDays(missing, MAX_ACCRUAL_DAYS);
+            const payloads = await Promise.all(
+                (chunks.length > 0 ? chunks : [[]]).map((dates, index) =>
+                    getEconomicsData(signal, dates, needsTypes && index === 0),
+                ),
             );
-            writeAccrualCache(merged);
 
-            return merged;
+            let merged = cache;
+            for (const payload of payloads) {
+                merged = mergeAccrualDays(merged, payload.days, payload.types, payload.fetchedAt);
+            }
+
+            const kept = pruneAccrualCache(merged, financeFetchDays);
+            writeAccrualCache(kept);
+
+            return kept;
         },
         // Day-level data: a slow refresh is enough, and every poll costs requests.
         { dedupingInterval: 2000, refreshInterval: 30 * 60 * 1000 },
@@ -390,6 +457,40 @@
         dispose: disposeMonthFinance,
     } = monthFinanceResult;
 
+    /**
+     * The realization report of the cards' own month.
+     *
+     * It is asked for separately because the cards are anchored to today while the month
+     * selector is free: choosing June leaves the section's own month — the previous calendar
+     * month — outside everything the page has loaded. Only the report is fetched, since a
+     * revenue-based tax needs nothing else from that month.
+     *
+     * The month is recorded before the request for the same reason the selector records its
+     * own: an answer must never be displayed under a month it does not belong to.
+     */
+    let requestedCardMonth = $state<string | null>(null);
+
+    const cardMonthFinanceResult = useSWR(
+        `ozon-card-realization:${clientId}`,
+        async (signal) => {
+            if (!$ozonKeys.clientId || !$ozonKeys.apiKey) {
+                throw new Error(
+                    "Укажите Client ID и API Key в настройках (шестерёнка справа сверху).",
+                );
+            }
+
+            requestedCardMonth = cardMonth;
+            return getMonthRealization(signal, cardMonth);
+        },
+        { dedupingInterval: 5000 },
+    );
+
+    const {
+        data: cardMonthData,
+        error: cardMonthError,
+        dispose: disposeCardMonth,
+    } = cardMonthFinanceResult;
+
     // Switching the month changes which days the accruals must cover; the SWR closures are
     // not reactive, so the refetch is asked for explicitly.
     let lastRequestedPeriod = $state("");
@@ -416,7 +517,6 @@
     const finance = $derived(
         summariseFinance(accrualDays, $financeData?.types ?? {}),
     );
-    const financeLoadError = $derived(describeFailure($financeError));
 
     // The same figures for the window before, so a month reads against its predecessor.
     const previousAccrualDays = $derived(
@@ -473,9 +573,7 @@
     onDestroy(disposeStocks);
     onDestroy(disposeFinance);
     onDestroy(disposeMonthFinance);
-
-    const isUp = (value: number | null) => value !== null && value >= 0;
-    const isDown = (value: number | null) => value !== null && value < 0;
+    onDestroy(disposeCardMonth);
 
     const pad = (value: number) => String(value).padStart(2, "0");
 
@@ -483,10 +581,6 @@
     function formatTime(date: Date) {
         return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
     }
-
-    /** Colors for the three window series (7 / 14 / 31 days). */
-    const SERIES_COLORS = ["#6366f1", "#a855f7", "#eab308"];
-    const seriesColor = (index: number) => SERIES_COLORS[index] ?? "#71717a";
 
     // The skeleton state owns the whole analytics area: without it every figure
     // would render as a zero while the 31-day load is still running, which reads as
@@ -542,7 +636,6 @@
     const routes = $derived(clusterRoutes(moneyWindow, 6));
     const actionStats = $derived(actionBreakdown(moneyWindow, 6));
     const promo = $derived(promoShare(moneyWindow));
-    const deltas = $derived(compareWindows(postingsData));
 
     // Orders by local hour: answers "at what time do customers buy".
     const hours = $derived(
@@ -555,16 +648,6 @@
             hours[0],
         ),
     );
-
-    const monthStats = $derived(stats.calendarMonth);
-    const derivedMetrics = $derived([
-        { label: "Средний чек", value: formatCurrency(averageOrderValue(monthStats)) },
-        { label: "Доля отмен", value: formatPercent(cancellationRate(monthStats)) },
-        { label: "Штук в заказе", value: unitsPerOrder(monthStats).toFixed(1) },
-        { label: "Средняя цена", value: formatCurrency(averageUnitPrice(monthStats)) },
-        { label: "Продано штук", value: formatNumber(monthStats.netUnits) },
-        { label: "Кросс-кластер", value: formatNumber(monthStats.crossCluster) },
-    ]);
 
     // --- Tier 3: joins sales with the stock rows loaded above ---
     const stockRows = $derived($stocksData?.items ?? []);
@@ -597,6 +680,597 @@
     const costs = $derived(costBookLookup($costBook));
     const skuRows = $derived(skuEconomics(moneyWindow, costs));
 
+    // --- The four "right now" cards ---
+    //
+    // Anchored to today rather than to the month selector, because that is what "now" means:
+    // the section sits above every month-scoped figure precisely so the shop can be read
+    // without choosing anything. Each card is assembled from the same four sources as the
+    // rest of the page — orders, accruals, returns and the cost book — and every money figure
+    // is withheld rather than guessed when one of them is missing.
+    /** Everything one card knows, which is what its tooltips explain. */
+    interface CardFigures {
+        window: { open: boolean; label: string; range: string; from: string; to: string };
+        orders: OrdersTotals;
+        returns: ReturnsTotals;
+        accrual: AccrualTotals;
+        cost: CogsTotals;
+        profit: CardProfit;
+    }
+
+    /** One row of a tooltip: a name on the left, a figure on the right. */
+    interface TipRow {
+        label: string;
+        value: string;
+        /**
+         * `sub` is a part of the row above it, not a sibling: a breakdown nested inside its
+         * own total, so nobody adds a part to the total it already belongs to.
+         */
+        tone?: "total" | "aside" | "minus" | "sub";
+    }
+
+    /** What each metric of a card is made of. */
+    type CardMetric = "sales" | "orders" | "cancelled" | "returns" | "adv" | "payout" | "profit";
+
+    /**
+     * The arithmetic behind one metric, as rows for its tooltip.
+     *
+     * Kept here rather than in the markup: seven metrics across four cards is twenty-eight
+     * explanations, and written inline they would bury the layout they belong to. Every figure
+     * comes from the same card object the metric itself renders, so a tooltip cannot drift from
+     * the number it explains — which is the whole point of showing it.
+     */
+    function tipRows(
+        card: CardFigures,
+        metric: CardMetric,
+    ): { rows: TipRow[]; footer: string } {
+        const types = $financeData?.types ?? {};
+        const settings = $taxSettings;
+        const money = (value: number) => formatCurrency(value);
+        // Breakdowns are formatted with kopecks: their parts have to visibly make the whole.
+        const exact = (value: number) => formatCurrencyPrecise(value);
+        const count = (value: number) => formatNumber(value);
+        const share = (value: number) => formatPercent(value * 100, 1);
+        const percent = String(settings.percent).replace(".", ",");
+        const days = Math.max(1, card.accrual.expected || daysBetween(card.window.from, card.window.to).length);
+        const perDay = (value: number) => money(value / days);
+
+        const sales = card.orders.sales;
+        const allOrders = card.orders.orders + card.orders.cancelled;
+        const cancelledSum = card.orders.cancelledSum;
+        const grossMoney = sales + cancelledSum;
+
+        if (metric === "sales") {
+            return {
+                rows: [
+                    { label: "Заказов без отмен", value: count(card.orders.orders) },
+                    { label: "Штук", value: count(card.orders.units) },
+                    {
+                        label: "Средняя цена штуки",
+                        value: card.orders.units > 0 ? money(sales / card.orders.units) : "—",
+                    },
+                    {
+                        label: "Средний заказ",
+                        value: card.orders.orders > 0 ? money(sales / card.orders.orders) : "—",
+                    },
+                    {
+                        label: "Отменено",
+                        value:
+                            card.orders.cancelled > 0
+                                ? `${count(card.orders.cancelled)} на ${money(cancelledSum)}`
+                                : "нет",
+                        tone: "minus",
+                    },
+                    {
+                        label: "Кросс-кластерных отправлений",
+                        value: count(card.orders.crossCluster),
+                        tone: "aside",
+                    },
+                    { label: "В среднем в день", value: perDay(sales), tone: "aside" },
+                ],
+                footer:
+                    `Цена продавца по не отменённым заказам, созданным в окне «${card.window.range}». ` +
+                    "Это деньги покупателя: комиссия Ozon, логистика, эквайринг и реклама из них ещё " +
+                    "не вычтены, поэтому Sales не равен тому, что придёт на счёт. Кросс-кластерные " +
+                    "отправления — те, что едут между кластерами: логистика по ним дороже. Источник — " +
+                    "лента заказов /v3/posting/fbo/list по дате создания заказа.",
+            };
+        }
+
+        if (metric === "orders") {
+            return {
+                rows: [
+                    { label: "Заказов", value: count(card.orders.orders) },
+                    { label: "Штук", value: count(card.orders.units) },
+                    {
+                        label: "Штук в заказе",
+                        value:
+                            card.orders.orders > 0
+                                ? (card.orders.units / card.orders.orders).toFixed(2).replace(".", ",")
+                                : "—",
+                    },
+                    {
+                        label: "Средний чек",
+                        value: card.orders.orders > 0 ? money(sales / card.orders.orders) : "—",
+                    },
+                    {
+                        label: "Отменено",
+                        value:
+                            card.orders.cancelled > 0
+                                ? `${count(card.orders.cancelled)} заказов · ${count(card.orders.cancelledUnits)} шт`
+                                : "нет",
+                        tone: "minus",
+                    },
+                    {
+                        label: "Доля отмен",
+                        value: allOrders > 0 ? share(card.orders.cancelled / allOrders) : "—",
+                        tone: "aside",
+                    },
+                    { label: "Заказов в день", value: perDay(card.orders.orders), tone: "aside" },
+                ],
+                footer:
+                    "Считается по дате создания заказа, а не по дате отгрузки: «сегодня» — это " +
+                    "оформленные сегодня заказы, а не отправленные. Отменённые заказы показаны " +
+                    "отдельной строкой и в Orders / Units не входят. Окно — " +
+                    `${card.window.range}, ${count(days)} дн.`,
+            };
+        }
+
+        if (metric === "cancelled") {
+            return {
+                rows: [
+                    { label: "Заказов", value: count(card.orders.cancelled) },
+                    { label: "Штук", value: count(card.orders.cancelledUnits) },
+                    { label: "Сумма по цене продавца", value: money(cancelledSum) },
+                    {
+                        label: "Доля отказов",
+                        value: allOrders > 0 ? share(card.orders.cancelled / allOrders) : "—",
+                    },
+                    {
+                        label: "Потеряно от выручки окна",
+                        value: grossMoney > 0 ? share(cancelledSum / grossMoney) : "—",
+                        tone: "aside",
+                    },
+                ],
+                footer:
+                    "Заказы со статусом cancelled, созданные в окне. В Sales, Orders / Units и в " +
+                    "прибыли они не участвуют: отменённый заказ денег не приносит. «Потеряно от " +
+                    "выручки окна» — доля отменённых денег в сумме заказов вместе с отменёнными, " +
+                    "то есть ответ на вопрос «сколько мы недополучили из-за отказов».",
+            };
+        }
+
+        if (metric === "returns") {
+            const rows: TipRow[] = [
+                { label: "Возвратов", value: count(card.returns.count) },
+                { label: "Штук", value: count(card.returns.units) },
+            ];
+
+            // Parts first, the total after them: a sum that appears above its own terms reads as
+            // one more independent number.
+            if (card.returns.notPickedUp.count > 0) {
+                rows.push({
+                    label: `не забрали заказ · ${count(card.returns.notPickedUp.count)} шт`,
+                    value: exact(card.returns.notPickedUp.amount),
+                    tone: "sub",
+                });
+            }
+            if (card.returns.clientReturn.count > 0) {
+                rows.push({
+                    label: `вернули после получения · ${count(card.returns.clientReturn.count)} шт`,
+                    value: exact(card.returns.clientReturn.amount),
+                    tone: "sub",
+                });
+            }
+            if (card.returns.other.count > 0) {
+                rows.push({
+                    label: `прочие типы · ${count(card.returns.other.count)} шт`,
+                    value: exact(card.returns.other.amount),
+                    tone: "sub",
+                });
+            }
+
+            rows.push({
+                label: "Сумма по цене продажи",
+                value: exact(card.returns.amount),
+                tone: "total",
+            });
+
+            const soldUnits = card.orders.units + card.returns.units;
+            rows.push({
+                label: "Доля от проданных штук",
+                value: soldUnits > 0 ? share(card.returns.units / soldUnits) : "—",
+                tone: "aside",
+            });
+
+            return {
+                rows,
+                footer:
+                    "Возвраты, оформленные в окне: дата — logistic.return_date из реестра " +
+                    "/v1/returns/list, а не дата заказа. Из Sales они не вычитаются: возврат " +
+                    "приходит своей датой и своими деньгами, а сумма здесь — цена продажи " +
+                    "возвращённых штук, не сумма возврата покупателю. «Не забрали» — покупатель не " +
+                    "пришёл за заказом, «вернули» — забрал и принёс обратно.",
+            };
+        }
+
+        if (metric === "adv") {
+            if (!card.accrual.complete) {
+                return {
+                    rows: [
+                        {
+                            label: "Дней с начислениями",
+                            value: `${count(card.accrual.loaded)} из ${count(card.accrual.expected)}`,
+                            tone: "aside",
+                        },
+                    ],
+                    footer:
+                        "Начисления за это окно загружены не полностью, поэтому рекламные удержания " +
+                        "не показаны: часть их выглядела бы как весь расход. За сегодня начисления " +
+                        "приходят на следующий день.",
+                };
+            }
+
+            const rows: TipRow[] = Object.entries(card.accrual.advertisingByType)
+                .sort((a, b) => b[1] - a[1])
+                .map(([typeId, amount]) => ({
+                    label: types[typeId] ?? `Вид удержания ${typeId}`,
+                    value: exact(amount),
+                    tone: "sub" as const,
+                }));
+
+            rows.push({
+                label: "Итого реклама",
+                value: exact(card.accrual.advertising),
+                tone: "total",
+            });
+            rows.push({
+                label: "ДРР от Sales",
+                value: sales > 0 ? share(card.accrual.advertising / sales) : "—",
+                tone: "aside",
+            });
+            rows.push({
+                label: "Доля в начислении",
+                value:
+                    card.accrual.net !== 0
+                        ? share(card.accrual.advertising / Math.abs(card.accrual.net))
+                        : "—",
+                tone: "aside",
+            });
+            rows.push({
+                label: "В среднем в день",
+                value: perDay(card.accrual.advertising),
+                tone: "aside",
+            });
+
+            return {
+                rows,
+                footer:
+                    "Рекламные удержания Ozon из начислений за окно: оплата за клик и соседние " +
+                    "механики (виды 41, 54, 33, 23, 87, 130, названия — из справочника " +
+                    "/v1/finance/accrual/types). Они уже вычтены внутри Est. payout, поэтому " +
+                    "отдельно из прибыли не вычитаются. ДРР — доля рекламных расходов от Sales; у " +
+                    "Ozon в кабинете она считается от продаж, здесь — от цены продавца в окне.",
+            };
+        }
+
+        if (metric === "payout") {
+            if (!card.accrual.complete) {
+                return {
+                    rows: [
+                        {
+                            label: "Дней с начислениями",
+                            value: `${count(card.accrual.loaded)} из ${count(card.accrual.expected)}`,
+                            tone: "aside",
+                        },
+                    ],
+                    footer:
+                        "Начисления за это окно ещё не пришли целиком: сумма не показана, чтобы часть " +
+                        "не выглядела как целое. За сегодня начисления приходят на следующий день — " +
+                        "цифра появится завтра.",
+                };
+            }
+
+            const categoryLabels: Record<string, string> = {
+                POSTING: "начисления на отправления",
+                ITEM: "начисления на товары (эквайринг)"
+            };
+
+            /*
+                One hierarchy, not two overlapping splits. The cabinet's own costs ARE the
+                NON_ITEM category and the orders ARE POSTING plus ITEM — checked against the
+                live account for September 2026, where 155 245,22 − 5 289,72 = 149 955,50 ₽ of
+                orders and −12 741,79 ₽ of cabinet costs. Showing both splits side by side, as
+                this tooltip first did, printed the same 12 742 ₽ twice and invited the reader to
+                add numbers that must not be added.
+            */
+            const rows: TipRow[] = [
+                { label: "По заказам", value: exact(card.accrual.orders) }
+            ];
+
+            for (const [category, label] of Object.entries(categoryLabels)) {
+                const amount = card.accrual.byCategory[category];
+                if (typeof amount !== "number" || amount === 0) continue;
+                rows.push({ label, value: exact(amount), tone: "sub" });
+            }
+
+            rows.push({
+                label: "Расходы кабинета (NON_ITEM)",
+                value: exact(card.accrual.cabinet),
+                tone: "minus"
+            });
+            rows.push({
+                label: "в том числе реклама",
+                value: exact(card.accrual.advertising),
+                tone: "sub"
+            });
+            rows.push({
+                label: "Итого начислено",
+                value: exact(card.accrual.net),
+                tone: "total"
+            });
+            rows.push({
+                label: `За ${count(days)} дн., в среднем`,
+                value: money(card.accrual.net / days),
+                tone: "aside"
+            });
+
+            return {
+                rows,
+                footer:
+                    `Сумма total_amount по ${count(card.accrual.loaded)} дн. окна «${card.window.range}» — ` +
+                    "то, что Ozon начислил за эти дни. Категории Ozon: POSTING — начисление на " +
+                    "отправление (цена минус комиссия и услуги), ITEM — начисление на товар, " +
+                    "включая эквайринг, NON_ITEM — расходы кабинета: хранение, реклама, кросс-докинг. " +
+                    "Расходы кабинета и есть NON_ITEM, а по заказам — это POSTING плюс ITEM, поэтому " +
+                    "строки не складываются друг с другом: части вложены в свои итоги. Суммы показаны " +
+                    "с копейками, чтобы части сходились с итогом: в рублях округление разошлось бы на " +
+                    "рубль. На счёт приходит позже, недельными выплатами, а не в день начисления." +
+                    (card.window.open
+                        ? " За сегодня начисления приходят на следующий день, поэтому цифра ещё вырастет."
+                        : ""),
+            };
+        }
+
+        // Net profit: the chain itself, and the reason a link may be missing.
+        const rows: TipRow[] = [];
+        if (card.profit.payout !== null) {
+            rows.push({ label: "Начислено", value: exact(card.profit.payout) });
+        }
+        if (card.profit.cogs !== null) {
+            rows.push({ label: "Себестоимость проданного", value: exact(card.profit.cogs), tone: "minus" });
+            if (card.cost.units > 0) {
+                rows.push({
+                    label: `за штуку (в среднем по ${count(card.cost.units)} шт)`,
+                    value: money(card.profit.cogs / card.cost.units),
+                    tone: "aside",
+                });
+            }
+        }
+        if (card.profit.tax !== null) {
+            rows.push({
+                label: `Налог ${percent}% (${TAX_BASE_LABELS[settings.base]})`,
+                value: exact(card.profit.tax),
+                tone: "minus",
+            });
+        }
+        if (card.profit.taxable !== null) {
+            rows.push({ label: "База налога", value: exact(card.profit.taxable), tone: "aside" });
+        }
+        if (card.profit.netProfit !== null) {
+            rows.push({ label: "Остаётся", value: exact(card.profit.netProfit), tone: "total" });
+            if (card.profit.payout !== null && card.profit.payout !== 0) {
+                rows.push({
+                    label: "Маржа от начисления",
+                    value: share(card.profit.netProfit / card.profit.payout),
+                    tone: "aside",
+                });
+            }
+        }
+        if (!card.profit.costKnown && card.cost.units > 0) {
+            rows.push({
+                label: "Себестоимость известна для",
+                value: `${count(card.cost.coveredUnits)} из ${count(card.cost.units)} шт`,
+                tone: "aside",
+            });
+        }
+
+        const parts = [
+            `Цепочка: начислено минус себестоимость проданного и налог, окно «${card.window.range}».`,
+        ];
+        if (card.profit.taxable === null) {
+            parts.push(
+                "База налога — реализованное за вычетом возвратов, а её знает только месячный отчёт " +
+                    "Ozon: за незакрытый месяц его не существует, поэтому чистая прибыль не показана.",
+            );
+        } else {
+            parts.push(
+                `Налог: ${percent}% от базы «${TAX_BASE_LABELS[settings.base]}», то есть от ${money(card.profit.taxable)}.`,
+            );
+        }
+        if (!card.profit.costKnown && card.cost.units > 0) {
+            parts.push(
+                `Себестоимость известна для ${share(card.cost.coveredUnits / card.cost.units)} проданных штук — ` +
+                    "прибыль не показывается, пока не покрыты все: подставить ноль значило бы выдать " +
+                    "отсутствие данных за убыток. Заполнить её можно кнопкой «Себестоимость» в разделе " +
+                    "«Деньги».",
+            );
+        } else if (card.profit.costKnown) {
+            parts.push(
+                "Себестоимость берётся из вашей книги на дату заказа, а проданные штуки — по отчёту " +
+                    "о реализации; единицы с возвратами из себестоимости вычтены.",
+            );
+        }
+        parts.push(
+            "Реклама отдельно не вычитается: она уже внутри начисления, эта же величина показана " +
+                "строкой Adv. cost.",
+        );
+
+        return { rows, footer: parts.join(" ") };
+    }
+
+    /**
+     * The one-line hint under a figure, so the tooltip does not have to be opened to read it.
+     *
+     * The card carries what is worth knowing at a glance — the split behind a payout, the tax
+     * inside a profit, the reason a figure is missing — and the tooltip keeps the rest. Written
+     * as a function for the same reason the rows are: twenty-eight texts is not markup.
+     */
+    function cardNote(card: CardFigures, metric: CardMetric): string | undefined {
+        const money = (value: number) => formatCurrency(value);
+        const share = (value: number) => formatPercent(value * 100, 1);
+
+        if (metric === "sales") {
+            return card.orders.units > 0
+                ? `${money(card.orders.sales / card.orders.units)} за штуку`
+                : undefined;
+        }
+
+        if (metric === "orders") {
+            return card.orders.orders > 0
+                ? `${money(card.orders.sales / card.orders.orders)} средний чек`
+                : undefined;
+        }
+
+        if (metric === "cancelled") {
+            const all = card.orders.orders + card.orders.cancelled;
+            if (card.orders.cancelled === 0) return "отказов нет";
+            return all > 0 ? `${share(card.orders.cancelled / all)} всех заказов` : undefined;
+        }
+
+        if (metric === "returns") {
+            if (card.returns.count === 0) return "возвратов нет";
+            const parts: string[] = [];
+            if (card.returns.notPickedUp.count > 0) {
+                parts.push(`не забрали ${formatNumber(card.returns.notPickedUp.count)}`);
+            }
+            if (card.returns.clientReturn.count > 0) {
+                parts.push(`вернули ${formatNumber(card.returns.clientReturn.count)}`);
+            }
+            return parts.join(" · ");
+        }
+
+        if (metric === "adv") {
+            if (!card.accrual.complete) return "начисления за окно ещё не пришли";
+            if (card.orders.sales <= 0 || card.accrual.advertising === 0) return undefined;
+            return `ДРР ${share(card.accrual.advertising / card.orders.sales)} от Sales`;
+        }
+
+        if (metric === "payout") {
+            if (!card.accrual.complete) return "начисления приходят на следующий день";
+            const cabinet = card.accrual.cabinet;
+            return (
+                `по заказам ${formatCurrencyPrecise(card.accrual.orders)} · кабинет ` +
+                `${cabinet < 0 ? "−" : ""}${formatCurrencyPrecise(Math.abs(cabinet))}`
+            );
+        }
+
+        // Net profit: the tax that was charged, or why no figure is shown.
+        if (card.profit.netProfit !== null) {
+            const tax = card.profit.tax !== null ? `налог ${money(card.profit.tax)}` : null;
+            const margin =
+                card.profit.payout !== null && card.profit.payout !== 0
+                    ? `маржа ${share(card.profit.netProfit / card.profit.payout)}`
+                    : null;
+            return [tax, margin].filter(Boolean).join(" · ") || undefined;
+        }
+        if (card.profit.taxable === null) return "нет базы налога: месяц не закрыт";
+        if (!card.profit.costKnown && card.cost.units > 0) {
+            return `себестоимость: ${share(card.cost.coveredUnits / card.cost.units)} штук`;
+        }
+        if (card.profit.payout === null) return "начисления ещё не пришли";
+        return undefined;
+    }
+
+    const returnsFeed = $derived($dashboardData?.returns ?? []);
+    // The cards' own month, if its report has arrived and belongs to the month asked for.
+    const cardRealization = $derived(
+        monthView(
+            cardMonth,
+            requestedCardMonth,
+            $cardMonthData,
+            $cardMonthError as { status?: number; message?: string } | null,
+        ).data?.realization ?? null,
+    );
+    const periodCards = $derived.by(() => {
+        const settings = $taxSettings;
+        const days = $financeData?.days ?? {};
+
+        /**
+         * The closed month's own figures: realized revenue minus returns, and the cost of the
+         * goods that report says were sold. Everything else in the section has neither, which
+         * is why the daily cards charge a revenue-based tax on nothing at all.
+         */
+        const cardBounds = monthBounds(cardMonth);
+        const monthly = cardRealization
+            ? {
+                  realized: cardRealization.net,
+                  cost: realizationCost(
+                      cardRealization.perSku,
+                      cardBounds ? new Date(`${cardBounds.to}T23:59:59`) : new Date(),
+                      costs,
+                  ),
+              }
+            : null;
+
+        /** One window's figures, so a card and its comparison are built the same way. */
+        const measure = (
+            from: string,
+            to: string,
+            closedMonth?: { realized: number; cost: CogsTotals },
+        ) => {
+            const orders = ordersTotals(postingsData, from, to);
+            const returns = returnsTotals(returnsFeed, from, to);
+            const accrual = accrualTotals(days, daysBetween(from, to));
+            const cost = closedMonth
+                ? closedMonth.cost
+                : costOfGoods(postingsData, returnsFeed, from, to, costs);
+            const profit = cardProfit({
+                accrual,
+                // The order feed's seller price is not the realized revenue: it is nearly twice
+                // it, because it includes the discount Ozon funds itself. Only the monthly
+                // report states the figure the tax is charged on.
+                realized: closedMonth ? closedMonth.realized : null,
+                cost,
+                taxPercent: settings.percent,
+                base: settings.base,
+            });
+
+            return { orders, returns, accrual, cost, profit };
+        };
+
+        return cardWindows().map((window) => {
+            const current = measure(
+                window.from,
+                window.to,
+                window.key === 'lastMonth' ? (monthly ?? undefined) : undefined,
+            );
+            const previous = window.compare
+                ? measure(window.compare.from, window.compare.to)
+                : null;
+
+            // An open window is compared to nothing: today against a finished yesterday would
+            // report the morning as a collapse, which is the kind of figure this page spends
+            // its comments refusing to print.
+            const comparable = !window.open && previous !== null;
+
+            return {
+                window,
+                ...current,
+                deltaSales:
+                    comparable && previous
+                        ? deltaPercent(current.orders.sales, previous.orders.sales)
+                        : null,
+                deltaProfit:
+                    comparable &&
+                    previous &&
+                    current.profit.netProfit !== null &&
+                    previous.profit.netProfit !== null
+                        ? deltaPercent(current.profit.netProfit, previous.profit.netProfit)
+                        : null,
+            };
+        });
+    });
+
     /**
      * Ozon's commission rate per article, and the spread across them.
      *
@@ -604,8 +1278,6 @@
      * ran from 17 % to 52 %, the blend being pulled up by two high-revenue suitcases. A
      * seller prices per article, so the per-article figure is the one that answers anything.
      */
-    const commission = $derived(commissionSpread(moneyWindow));
-
     /**
      * Money that may be unknown.
      *
@@ -656,24 +1328,16 @@
 
         const bounds = monthBounds(periodMonth);
         const at = bounds ? new Date(`${bounds.to}T23:59:59`) : new Date();
+        // The same helper the cards use for their closed month, so one definition of cost of
+        // goods serves both and they cannot disagree about the same month.
+        const totals = realizationCost(realization.perSku, at, costs);
 
-        let cost = 0;
-        let covered = 0;
-        let units = 0;
-
-        for (const line of realization.perSku) {
-            const sold = Math.max(0, line.units - line.returnedUnits);
-            if (sold === 0) continue;
-
-            units += sold;
-            const unitCost = costs(line.offerId, line.sku, at);
-            if (unitCost === undefined) continue;
-
-            cost += sold * unitCost;
-            covered += sold;
-        }
-
-        return { cost, covered, units, complete: units > 0 && covered === units };
+        return {
+            cost: totals.cogs,
+            covered: totals.coveredUnits,
+            units: totals.units,
+            complete: totals.complete
+        };
     });
 
     /**
@@ -797,58 +1461,6 @@
             realized
         };
     });
-
-    const marginTotals = $derived.by(() => {
-        // Only rows where every unit has both a payout and a cost carry a profit figure.
-        const complete = skuRows.filter((row) => row.grossProfit !== null);
-        const payout = complete.reduce((sum, row) => sum + row.payout, 0);
-        const profit = complete.reduce((sum, row) => sum + (row.grossProfit ?? 0), 0);
-
-        return {
-            payout,
-            profit,
-            marginPercent: payout > 0 ? (profit / payout) * 100 : null,
-            covered: complete.length,
-            total: skuRows.length,
-            /** Units whose cost is known, against all units sold. */
-            costedUnits: skuRows.reduce(
-                (sum, row) => sum + row.units * row.costCoverage,
-                0,
-            ),
-            units: skuRows.reduce((sum, row) => sum + row.units, 0),
-            /** An empty book means margin is not merely incomplete, it is unavailable. */
-            hasAnyCost: skuRows.some((row) => row.costCoverage > 0)
-        };
-    });
-
-    // ABC by profit once costs are known, by what the seller keeps before that: ranking
-    // a catalogue by revenue is what made thin-margin bestsellers look like leaders.
-    const abcUsesProfit = $derived(marginTotals.covered > 0);
-    const abc = $derived(
-        abcAnalysis(
-            skuRows.map((row) => ({
-                key: row.key,
-                label: row.name,
-                value: abcUsesProfit ? (row.grossProfit ?? 0) : row.payout
-            })),
-        ),
-    );
-    const abcCounts = $derived({
-        A: abc.filter((row) => row.grade === "A").length,
-        B: abc.filter((row) => row.grade === "B").length,
-        C: abc.filter((row) => row.grade === "C").length
-    });
-
-    const losers = $derived(
-        lossMaking(skuRows).map((row) => ({
-            ...row,
-            unitCost: row.units > 0 && row.cogs !== null ? row.cogs / row.units : null,
-            breakEven: breakEvenPrice(
-                row.units > 0 && row.cogs !== null ? row.cogs / row.units : null,
-                row.payoutRatio
-            )
-        })),
-    );
 
     let showCogs = $state(false);
 
@@ -1010,44 +1622,6 @@
         if (payload) lastUpdated = new Date();
     });
 
-    const statsConfig = $derived([
-        {
-            label: "Last 24 Hours",
-            value: stats.last24h,
-            color: "#6366F1",
-            icon: `<path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />`,
-        },
-        {
-            label: "Last 7 Days",
-            value: stats.last7d,
-            color: "#8B5CF6",
-            icon: `<path d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />`,
-        },
-        {
-            label: "Last 31 Days",
-            value: stats.last31d,
-            color: "#EC4899",
-            icon: `<path d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />`,
-        },
-        {
-            label: "Calendar Day",
-            value: stats.calendarDay,
-            color: "#F59E0B",
-            icon: `<path d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707m12.728 12.728L5.636 5.636" />`,
-        },
-        {
-            label: "Calendar Week",
-            value: stats.calendarWeek,
-            color: "#10B981",
-            icon: `<path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0h6v-9a2 2 0 012-2h2a2 2 0 012 2v9m-18 0h18" />`,
-        },
-        {
-            label: "Calendar Month",
-            value: stats.calendarMonth,
-            color: "#3B82F6",
-            icon: `<path d="M21.21 15.89A10 10 0 118 2.83M22 12A10 10 0 0012 2v10h10z" />`,
-        },
-    ]);
 </script>
 
 <svelte:head>
@@ -1125,10 +1699,10 @@
 
     <section class="stats-section" aria-busy={showSkeletons}>
         <div class="bento-header">
-            <h2 class="section-title">Сейчас · выручка по шести периодам</h2>
+            <h2 class="section-title">Сейчас · четыре периода</h2>
             <InfoTip
-                text="Фиксированный обзор: три календарных окна (с 00:00 сегодня, с понедельника, с 1-го числа) и три скользящих (последние 24 часа, 7 и 31 день от текущего момента). Этот блок не подчиняется переключателю периода вверху — он всегда показывает все шесть окон сразу, чтобы видеть масштаб. Большое число в карточке — цена продавца без отменённых заказов, то есть деньги покупателя; строка Gross — до вычетов. Сколько из этих денег остаётся вам, считают разделы «Деньги» и «Начисления»."
-                label="Пояснение к периодам выручки"
+                text="Четыре окна, привязанных к сегодняшнему дню, а не к переключателю периода ниже: сегодня (с 00:00), вчера, с начала календарного месяца и прошлый закрытый месяц. Sales — цена продавца без отменённых заказов, то есть деньги покупателя. Отмены и возвраты показаны отдельными строками и из Sales не вычтены: отмена — это заказ, который не состоялся, а возврат приходит своей датой и своими деньгами. Adv. cost — рекламные удержания Ozon из начислений (оплата за клик и соседние механики), они уже вычтены внутри Est. payout и второй раз из прибыли не вычитаются. Est. payout — сколько Ozon начислил за окно, то есть что дойдёт до счёта; Net profit — то же минус себестоимость проданного и налог по вашим настройкам (ставка и база берутся из них же). У каждой строки есть подсказка при наведении: из чего сложилась сумма, что в неё не вошло и откуда взяты данные. Для базы «от реализованного» налог считается по месячному отчёту Ozon: за прошлый месяц он есть, а за текущий, ещё не закрытый, его не существует — там прочерк, потому что цена заказов почти вдвое больше реализованного и налог по ней был бы завышен. Где начислений или себестоимости не хватает на всё окно, тоже прочерк: пустой ответ не показывается нулём."
+                label="Пояснение к периодам"
             />
             <span class="updated-at" role="status" aria-live="polite">
                 {#if showSkeletons}
@@ -1141,295 +1715,183 @@
             </span>
         </div>
 
-        <div class="bento-grid">
+        <div class="period-grid">
             {#if showSkeletons}
-                <!-- Same six grid children in the same order, so the areas line up. -->
-                <div class="bento-card hero-card glass-panel">
-                    <span class="skeleton sk-hero"></span>
-                    <span class="skeleton sk-line"></span>
-                </div>
-                <div class="bento-card medium-card glass-panel">
-                    <span class="skeleton sk-medium"></span>
-                    <span class="skeleton sk-line"></span>
-                </div>
-                <div class="bento-card medium-card glass-panel">
-                    <span class="skeleton sk-medium"></span>
-                    <span class="skeleton sk-line"></span>
-                </div>
-                {#each [1, 2, 3] as card (card)}
-                    <div class="bento-card small-card glass-panel">
+                {#each [1, 2, 3, 4] as card (card)}
+                    <div class="period-card glass-panel">
                         <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-small"></span>
+                        <span class="skeleton sk-medium"></span>
+                        <span class="skeleton sk-line"></span>
                     </div>
                 {/each}
             {:else}
-            <!-- Hero Card: Calendar Day -->
-            <div class="bento-card hero-card glass-panel glow-effect">
-                <div class="card-content">
-                    <div class="card-header">
-                        <span class="bento-label">Календарный день</span>
-                        <span
-                            class="live-indicator"
-                            class:busy={$isValidating}
-                            class:stale={showingStaleData}
-                            aria-hidden="true"
-                        ></span>
-                    </div>
-                    <div class="card-main-value">
-                        <span class="currency-symbol">₽</span>
-                        <span class="diamond-text text-xl"
-                            >{formatCurrencyParts(stats.calendarDay.netSum).amount}</span
-                        >
-                        <!-- This is the seller's price, i.e. what the buyer pays. It is
-                             not what reaches the account; the money block below says
-                             how much Ozon keeps. -->
-                        <div>Выручка продавца · без отмен</div>
-                    </div>
-                    <div class="card-sub-stats">
-                        <div class="sub-stat">
-                            <span class="sub-label">С отменами</span>
-                            <span class="sub-value"
-                                >{formatCurrency(stats.calendarDay.sum)}</span
+                {#each periodCards as card (card.window.key)}
+                    {@const salesTip = tipRows(card, "sales")}
+                    {@const ordersTip = tipRows(card, "orders")}
+                    {@const cancelledTip = tipRows(card, "cancelled")}
+                    {@const returnsTip = tipRows(card, "returns")}
+                    {@const advTip = tipRows(card, "adv")}
+                    {@const payoutTip = tipRows(card, "payout")}
+                    {@const profitTip = tipRows(card, "profit")}
+                    {@const salesNote = cardNote(card, "sales")}
+                    {@const ordersNote = cardNote(card, "orders")}
+                    {@const cancelledNote = cardNote(card, "cancelled")}
+                    {@const returnsNote = cardNote(card, "returns")}
+                    {@const advNote = cardNote(card, "adv")}
+                    {@const payoutNote = cardNote(card, "payout")}
+                    {@const profitNote = cardNote(card, "profit")}
+                    <article class="period-card glass-panel tone-{card.window.key}">
+                        <header class="period-card-head">
+                            <span class="period-card-title">{card.window.label}</span>
+                            <span class="period-card-range">{card.window.range}</span>
+                        </header>
+
+                        <div class="period-card-body">
+                            <MetricTip
+                                heading="Sales"
+                                label="Как считается Sales"
+                                note={salesNote}
+                                title="Sales — цена продавца"
+                                rows={salesTip.rows}
+                                footer={salesTip.footer}
+                                wide
                             >
-                        </div>
-                        <div class="separator"></div>
-                        <div class="sub-stat">
-                            <span class="sub-label">Orders</span>
-                            <span class="sub-value"
-                                >{stats.calendarDay.count}</span
-                            >
-                        </div>
-                        {#if stats.calendarDay.cancelled > 0}
-                            <div class="separator"></div>
-                            <div class="sub-stat">
-                                <span class="sub-label text-error"
-                                    >Cancelled</span
-                                >
-                                <span class="sub-value text-error">
-                                    {stats.calendarDay.cancelled} ({formatCurrency(
-                                        stats.calendarDay.cancelledSum,
-                                    )})
+                                <span class="metric-value metric-lead">
+                                    {formatCurrencyParts(card.orders.sales).amount}<span class="unit"
+                                        >₽</span
+                                    >
+                                    {#if card.deltaSales !== null}
+                                        <span
+                                            class="metric-delta"
+                                            class:negative={card.deltaSales < 0}
+                                            >{formatDelta(card.deltaSales)}</span
+                                        >
+                                    {/if}
                                 </span>
-                            </div>
-                        {/if}
-                    </div>
-                </div>
-            </div>
+                            </MetricTip>
 
-            <!-- Medium Card: Calendar Week -->
-            <div class="bento-card medium-card glass-panel">
-                <div class="card-content">
-                    <span class="bento-label">Календарная неделя</span>
-                    <div class="card-value-group">
-                        <!-- Main: Net Sales -->
-                        <span class="diamond-text text-lg"
-                            >{formatCurrencyParts(stats.calendarWeek.netSum).amount}</span
-                        >
-                        <span class="unit">₽</span>
-                    </div>
-                    <div>
-                        <div class="mini-row">
-                            <span>Заказы:</span>
-                            <span class="mini-value"
-                                >{stats.calendarWeek.count}</span
+                            <MetricTip
+                                heading="Orders / Units"
+                                label="Как считаются заказы и штуки"
+                                note={ordersNote}
+                                title="Orders / Units"
+                                rows={ordersTip.rows}
+                                footer={ordersTip.footer}
                             >
-                        </div>
-                        <div class="mini-row">
-                            <span>Gross (с отменами):</span>
-                            <span class="mini-value"
-                                >{formatCurrency(stats.calendarWeek.sum)}</span
-                            >
-                        </div>
-                        {#if stats.calendarWeek.cancelled > 0}
-                            <div class="mini-row">
-                                <span class="text-error"
-                                    >Cancelled:</span
+                                <span class="metric-value"
+                                    >{formatNumber(card.orders.orders)} /
+                                    {formatNumber(card.orders.units)}</span
                                 >
-                                <span class="mini-value text-error">
-                                    {stats.calendarWeek.cancelled} ({formatCurrency(
-                                        stats.calendarWeek.cancelledSum,
-                                    )})
-                                </span>
-                            </div>
-                        {/if}
-                    </div>
-                </div>
-            </div>
+                            </MetricTip>
 
-            <!-- Medium Card: Calendar Month -->
-            <div class="bento-card medium-card glass-panel">
-                <div class="card-content">
-                    <span class="bento-label">Календарный месяц</span>
-                    <div class="card-value-group">
-                        <span class="diamond-text text-lg"
-                            >{formatCurrencyParts(stats.calendarMonth.netSum).amount}</span
-                        >
-                        <span class="unit">₽</span>
-                    </div>
-                    <div>
-                        <div class="mini-row">
-                            <span>Заказы:</span>
-                            <span class="mini-value"
-                                >{stats.calendarMonth.count}</span
+                            <MetricTip
+                                heading="Отмены"
+                                label="Как считаются отмены"
+                                note={cancelledNote}
+                                title="Отменённые заказы"
+                                rows={cancelledTip.rows}
+                                footer={cancelledTip.footer}
                             >
-                        </div>
-                        <div class="mini-row">
-                            <span>Gross (с отменами):</span>
-                            <span class="mini-value"
-                                >{formatCurrency(stats.calendarMonth.sum)}</span
-                            >
-                        </div>
-                        {#if stats.calendarMonth.cancelled > 0}
-                            <div class="mini-row">
-                                <span class="text-error"
-                                    >Cancelled:</span
-                                >
-                                <span class="mini-value text-error">
-                                    {stats.calendarMonth.cancelled} ({formatCurrency(
-                                        stats.calendarMonth.cancelledSum,
-                                    )})
+                                <span class="metric-value">
+                                    {formatNumber(card.orders.cancelled)}
+                                    {#if card.orders.cancelled > 0}
+                                        <span class="metric-aside"
+                                            >{formatCurrency(card.orders.cancelledSum)}</span
+                                        >
+                                    {/if}
                                 </span>
-                            </div>
-                        {/if}
-                    </div>
-                </div>
-            </div>
+                            </MetricTip>
 
-            <!-- Small Cards (Optimized for space) -->
-            <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Последние 24 часа</span>
-                <div class="small-value">
-                    <span class="diamond-text text-md"
-                        >{formatCurrencyParts(stats.last24h.netSum).amount}</span
-                    >
-                </div>
-                <div class="micro-stat-group">
-                    <div class="micro-stat">
-                        Orders: {stats.last24h.count}
-                    </div>
-                    <div class="micro-stat">
-                        Gross (с отменами): {formatCurrency(stats.last24h.sum)}
-                    </div>
-                    {#if stats.last24h.cancelled > 0}
-                        <div class="micro-stat text-error">
-                            -{formatCurrency(stats.last24h.cancelledSum)} ({stats
-                                .last24h.cancelled})
-                        </div>
-                    {/if}
-                </div>
-            </div>
+                            <MetricTip
+                                heading="Возвраты"
+                                label="Как считаются возвраты"
+                                note={returnsNote}
+                                title="Возвраты покупателей"
+                                rows={returnsTip.rows}
+                                footer={returnsTip.footer}
+                            >
+                                <span class="metric-value">
+                                    {formatNumber(card.returns.count)}
+                                    {#if card.returns.count > 0}
+                                        <span class="metric-aside"
+                                            >{formatCurrency(card.returns.amount)}</span
+                                        >
+                                    {/if}
+                                </span>
+                            </MetricTip>
 
-            <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Последние 7 дней</span>
-                <div class="small-value">
-                    <span class="diamond-text text-md"
-                        >{formatCurrencyParts(stats.last7d.netSum).amount}</span
-                    >
-                </div>
-                <div class="micro-stat-group">
-                    <div class="micro-stat">
-                        Orders: {stats.last7d.count}
-                    </div>
-                    <div class="micro-stat">
-                        Gross (с отменами): {formatCurrency(stats.last7d.sum)}
-                    </div>
-                    {#if stats.last7d.cancelled > 0}
-                        <div class="micro-stat text-error">
-                            -{formatCurrency(stats.last7d.cancelledSum)} ({stats
-                                .last7d.cancelled})
-                        </div>
-                    {/if}
-                </div>
-            </div>
+                            <MetricTip
+                                heading="Adv. cost"
+                                label="Из чего складывается расход на рекламу"
+                                note={advNote}
+                                title="Рекламные удержания Ozon"
+                                rows={advTip.rows}
+                                footer={advTip.footer}
+                            >
+                                <span class="metric-value">
+                                    {#if card.accrual.complete}
+                                        {formatCurrency(card.accrual.advertising)}
+                                    {:else}
+                                        <span class="metric-unknown">—</span>
+                                    {/if}
+                                </span>
+                            </MetricTip>
 
-            <div class="bento-card small-card glass-panel">
-                <span class="bento-label small">Последние 31 день</span>
-                <div class="small-value">
-                    <span class="diamond-text text-md"
-                        >{formatCurrencyParts(stats.last31d.netSum).amount}</span
-                    >
-                </div>
-                <div class="micro-stat-group">
-                    <div class="micro-stat">
-                        Orders: {stats.last31d.count}
-                    </div>
-                    <div class="micro-stat">
-                        Gross (с отменами): {formatCurrency(stats.last31d.sum)}
-                    </div>
-                    {#if stats.last31d.cancelled > 0}
-                        <div class="micro-stat text-error">
-                            -{formatCurrency(stats.last31d.cancelledSum)} ({stats
-                                .last31d.cancelled})
+                            <MetricTip
+                                heading="Est. payout"
+                                label="Из чего складывается начисление"
+                                note={payoutNote}
+                                title="Начислено Ozon за окно"
+                                rows={payoutTip.rows}
+                                footer={payoutTip.footer}
+                            >
+                                <span class="metric-value">
+                                    {#if card.profit.payout !== null}
+                                        {formatCurrency(card.profit.payout)}
+                                    {:else}
+                                        <span
+                                            class="metric-unknown"
+                                            title="Начисления за это окно ещё не пришли"
+                                            >—</span
+                                        >
+                                    {/if}
+                                </span>
+                            </MetricTip>
+
+                            <MetricTip
+                                heading="Net profit"
+                                label="Как считается чистая прибыль"
+                                note={profitNote}
+                                title="Что остаётся продавцу"
+                                rows={profitTip.rows}
+                                footer={profitTip.footer}
+                            >
+                                <span class="metric-value">
+                                    {#if card.profit.netProfit !== null}
+                                        {formatCurrency(card.profit.netProfit)}
+                                        {#if card.deltaProfit !== null}
+                                            <span
+                                                class="metric-delta"
+                                                class:negative={card.deltaProfit < 0}
+                                                >{formatDelta(card.deltaProfit)}</span
+                                            >
+                                        {/if}
+                                    {:else}
+                                        <span
+                                            class="metric-unknown"
+                                            title={card.profit.taxable === null
+                                                ? "Налог на реализованное берётся из месячного отчёта Ozon — за незакрытый месяц его ещё нет"
+                                                : "Нет начислений или себестоимости на всё окно"}
+                                            >—</span
+                                        >
+                                    {/if}
+                                </span>
+                            </MetricTip>
                         </div>
-                    {/if}
-                </div>
-            </div>
+                    </article>
+                {/each}
             {/if}
         </div>
-    </section>
-
-    <section class="insights-section">
-        <div class="bento-header">
-            <h2 class="section-title">Сейчас · ключевые показатели</h2>
-            <InfoTip
-                text="Производные показатели за текущий календарный месяц: средний чек, доля отмен, штук в заказе, средняя цена, проданные штуки и число кросс-кластерных отправлений. Два последних чипа — скользящие окна 24 часа и 7 дней (не календарные) и тоже без отмен, чтобы сравнивать с главным числом дашборда."
-                label="Пояснение к ключевым показателям"
-            />
-        </div>
-        <div class="kpi-strip">
-            {#if showSkeletons}
-                {#each [1, 2, 3, 4, 5, 6, 7, 8] as chip (chip)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            {:else}
-                {#each derivedMetrics as metric (metric.label)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="kpi-label">{metric.label}</span>
-                        <span class="kpi-value">{metric.value}</span>
-                    </div>
-                {/each}
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Выручка продавца · 24ч</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(deltas.last24h.netRevenue)}</span
-                    >
-                    <span
-                        class="kpi-delta"
-                        class:positive={isUp(deltas.last24h.netRevenueChangePct)}
-                        class:negative={isDown(deltas.last24h.netRevenueChangePct)}
-                        >{formatDelta(deltas.last24h.netRevenueChangePct)} к
-                        предыдущим 24ч</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Выручка продавца · 7 дней</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(deltas.last7d.netRevenue)}</span
-                    >
-                    <span
-                        class="kpi-delta"
-                        class:positive={isUp(deltas.last7d.netRevenueChangePct)}
-                        class:negative={isDown(deltas.last7d.netRevenueChangePct)}
-                        >{formatDelta(deltas.last7d.netRevenueChangePct)} к
-                        предыдущим 7 дням</span
-                    >
-                </div>
-            {/if}
-        </div>
-    </section>
-
-    <section class="period-bar panel glass-panel" aria-label="Месяц отчёта">
-        <div class="period-text">
-            <span class="period-title">Месяц отчёта</span>
-            <span class="period-note">
-                Влияет на разделы «Деньги», «Маржа и ассортимент» и «Капитал», а также на
-                цепочку «От реализованного до счёта» ниже.
-            </span>
-        </div>
-        <PeriodPicker bind:month={periodMonth} months={availableMonthList} />
     </section>
 
     {#if periodIsPartial}
@@ -1441,9 +1903,10 @@
                     : "данные неполные, суммы занижены"}.
             </p>
             <p class="muted-note">
-                Месячные документы Ozon при этом полные: раздел «Месяц: что дойдёт и что
-                останется» считает по ним, а не по загруженным заказам. Маржа и ABC ниже
-                строятся по заказам, поэтому за такой период они недоступны.
+                Месячные документы Ozon при этом полные: раздел «Месяц · деньги: от реализации
+                до счёта» считает по ним, а не по загруженным заказам, поэтому цепочка от
+                реализации до счёта за такой период остаётся верной. Разрезы продаж и таблица
+                заказов ниже строятся по заказам, поэтому за такой период они недоступны.
             </p>
             <!--
                 What was asked for against what arrived. The window is derived from the month
@@ -1485,6 +1948,22 @@
                 text="Здесь месяц читается по месячным документам Ozon, а не по ленте заказов, поэтому доступны и месяцы старше загруженного окна. «Реализовано» в отчёте Ozon — это НЕ цена продавца, а то, что заплатил покупатель: цена продавца собирается из трёх частей, и проверено на строке отчёта — 642,86 оплатил покупатель + 571,71 доплатил Ozon за свою скидку + 6,43 партнёр = 1221,00, ровно выставленная цена. Поэтому в цепочке ниже «Оплачено покупателями» — только первая из трёх частей, а цена продавца — их сумма. «Возвращено» — сумма возвратов клиентов, «Выплаты по механикам» — то, что доплачивают партнёры по программам лояльности. «Начислено» и «Выплачено» — из отчёта о балансе: первое это сколько Ozon насчитал за период, второе — сколько реально перевёл. Ниже из денег вычитаются налог (по умолчанию от реализованного за вычетом возвратов) и себестоимость — в этом порядке."
                 label="Пояснение к месячному разделу"
             />
+            <!--
+                The month control lives in the section it drives. It used to sit in a bar of its
+                own above every money section, which read as a page-level filter — while the
+                cards at the top of the page deliberately ignore it, being anchored to today.
+                The cost book moved here with it: the chain below is what needs a cost price, so
+                this is where a reader notices that one is missing.
+            -->
+            <div class="period-inline">
+                <span class="period-title">Месяц отчёта</span>
+                <PeriodPicker bind:month={periodMonth} months={availableMonthList} />
+                <button type="button" class="btn-inline" onclick={() => (showCogs = true)}>
+                    {monthCost.units > 0
+                        ? `Себестоимость (${monthCost.covered}/${monthCost.units} шт)`
+                        : `Себестоимость · в справочнике ${costBookSize}`}
+                </button>
+            </div>
         </div>
 
         {#if $monthFinanceLoading && !monthRealization}
@@ -1918,193 +2397,9 @@
 
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Месяц · маржа и ассортимент</h2>
-            <InfoTip
-                text="Маржа считается как «остаётся продавцу» минус себестоимость проданных штук. Себестоимость Ozon не знает и не отдаёт — её задаёт продавец, и она хранится в этом браузере. Пока себестоимость известна не по всем штукам, прибыль по товару не показывается: подставить ноль значило бы выдать отсутствие данных за убыток. ABC-разбор идёт по прибыли, когда она известна, и по остатку продавцу, пока нет."
-                label="Пояснение к марже"
-            />
-            <button
-                type="button"
-                class="btn-inline"
-                onclick={() => (showCogs = true)}
-            >
-                <!--
-                    When the period holds no orders, `(0/0)` reads as an empty cost book
-                    rather than as a period with nothing to price. The book's own size is the
-                    honest thing to show there.
-                -->
-                {marginTotals.total > 0
-                    ? `Себестоимость (${marginTotals.covered}/${marginTotals.total})`
-                    : `Себестоимость · в справочнике ${costBookSize}`}
-            </button>
-        </div>
-
-        <div class="kpi-strip">
-            {#if showSkeletons}
-                {#each [1, 2, 3, 4] as chip (chip)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            {:else if marginTotals.total === 0}
-                <!--
-                    Distinguished from "no cost set" on purpose: the cost book is shared across
-                    periods, so an empty month must not read as though the costs were lost.
-                -->
-                <div class="panel glass-panel state-note">
-                    <p>
-                        За {periodLabel} нет заказов, поэтому считать нечего — это не про
-                        себестоимость.
-                    </p>
-                    <p class="muted-note">
-                        Введённая себестоимость хранится в этом браузере и никуда не делась:
-                        она снова появится, как только в выбранном периоде будут продажи. Если
-                        выбран текущий месяц, в нём пока мало данных — попробуйте предыдущий.
-                    </p>
-                </div>
-            {:else if !marginTotals.hasAnyCost}
-                <div class="panel glass-panel state-note">
-                    <p>
-                        Себестоимость не задана, поэтому прибыль и маржа не считаются.
-                        Выручка, комиссия и остаток продавцу выше — настоящие, они
-                        приходят из Ozon.
-                    </p>
-                    <button
-                        type="button"
-                        class="btn-inline"
-                        onclick={() => (showCogs = true)}
-                    >
-                        Задать себестоимость
-                    </button>
-                </div>
-            {:else}
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Валовая прибыль</span>
-                    <span class="kpi-value">{formatCurrency(marginTotals.profit)}</span>
-                    <span class="kpi-delta"
-                        >по {marginTotals.covered} из {marginTotals.total} SKU</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Маржа</span>
-                    <span class="kpi-value"
-                        >{marginTotals.marginPercent === null
-                            ? "—"
-                            : formatPercent(marginTotals.marginPercent)}</span
-                    >
-                    <span class="kpi-delta">от остатка продавцу</span>
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Себестоимость продаж</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(
-                            marginTotals.payout - marginTotals.profit,
-                        )}</span
-                    >
-                    <span class="kpi-delta">по покрытым SKU</span>
-                </div>
-                <div class="kpi-chip glass-panel" class:alert={losers.length > 0}>
-                    <span class="kpi-label">Продаются в минус</span>
-                    <span class="kpi-value">{losers.length}</span>
-                    <span class="kpi-delta"
-                        >{marginTotals.costedUnits < marginTotals.units
-                            ? `себестоимость известна для ${Math.round(marginTotals.costedUnits)} из ${marginTotals.units} шт`
-                            : "по всем проданным штукам"}</span
-                    >
-                </div>
-            {/if}
-        </div>
-
-        {#if !showSkeletons && marginTotals.hasAnyCost}
-            <div class="panel glass-panel">
-                <div class="panel-head">
-                    <span class="panel-title-group">
-                        <h3 class="panel-title">
-                            ABC по {abcUsesProfit ? "прибыли" : "остатку продавцу"}
-                        </h3>
-                        <InfoTip
-                            text="Класс A — товары, дающие первые 80% результата, B — следующие 15%, C — остаток. Когда себестоимость известна, результат — это прибыль; иначе это остаток продавцу после комиссии."
-                            label="Пояснение к ABC"
-                        />
-                    </span>
-                    <div class="panel-controls">
-                        <span class="panel-note"
-                            >A {abcCounts.A} · B {abcCounts.B} · C {abcCounts.C}</span
-                        >
-                    </div>
-                </div>
-                {#if abc.length === 0}
-                    <p class="muted-note">Нет данных за период.</p>
-                {:else}
-                    <div class="mini-list">
-                        {#each abc.slice(0, 8) as row (row.key)}
-                            <div class="mini-row">
-                                <span class="mini-name" title={row.label}>
-                                    <span class="abc-badge" data-grade={row.grade}
-                                        >{row.grade}</span
-                                    >
-                                    {row.label}
-                                </span>
-                                <span class="mini-value"
-                                    >{formatCurrency(row.value)} · {formatPercent(
-                                        row.share,
-                                    )}{commission.byKey.has(row.key)
-                                        ? ` · комиссия ${formatPercent(
-                                              (commission.byKey.get(row.key) ?? 0) * 100,
-                                          )}`
-                                        : ""}</span
-                                >
-                            </div>
-                            <div
-                                class="mini-bar"
-                                style="width: {Math.max(2, Math.round(row.share))}%"
-                            ></div>
-                        {/each}
-                    </div>
-                {/if}
-            </div>
-        {/if}
-
-        {#if !showSkeletons && losers.length > 0}
-            <div class="panel glass-panel loss-panel">
-                <div class="panel-head">
-                    <span class="panel-title-group">
-                        <h3 class="panel-title">Продаются ниже себестоимости</h3>
-                        <InfoTip
-                            text="Эти товары приносят меньше, чем стоит их закупка. «Безубыточная цена» — цена, при которой товар перестанет терять деньги при текущей доле, остающейся продавцу."
-                            label="Пояснение к убыточным товарам"
-                        />
-                    </span>
-                </div>
-                <div class="loss-list">
-                    {#each losers as row (row.key)}
-                        <div class="loss-row">
-                            <span class="loss-name" title={row.name}>{row.name}</span>
-                            <span class="loss-money">
-                                <span class="loss-value"
-                                    >{formatCurrency(row.grossProfit ?? 0)}</span
-                                >
-                                <span class="loss-detail">
-                                    {row.units} шт · закупка
-                                    {formatCurrency(row.unitCost ?? 0)}/шт
-                                    {#if row.breakEven !== null}
-                                        · безубыток от
-                                        {formatCurrency(row.breakEven)}
-                                    {/if}
-                                </span>
-                            </span>
-                        </div>
-                    {/each}
-                </div>
-            </div>
-        {/if}
-    </section>
-    <section class="insights-section">
-        <div class="bento-header">
             <h2 class="section-title">Месяц · структура продаж</h2>
             <InfoTip
-                text="Разбивка продаж за выбранный месяц по разным срезам. Во всех разрезах отменённые заказы не учитываются. Период задаётся переключателем вверху страницы и общий для всех панелей раздела."
+                text="Разбивка продаж за выбранный месяц по разным срезам. Во всех разрезах отменённые заказы не учитываются. Период задаётся выбором месяца в разделе «Деньги: от реализации до счёта» и общий для всех панелей раздела."
                 label="Пояснение к разрезам продаж"
             />
         </div>
@@ -2120,7 +2415,7 @@
                     <span class="panel-title-group">
                         <h3 class="panel-title">Тренд выручки продавца · {periodLabel}</h3>
                         <InfoTip
-                            text="Цена продавца по дням за выбранный период (без отменённых заказов) — это деньги покупателя, а не поступление на счёт. Период задаётся переключателем вверху страницы и общий для всех разделов, включая график по часам."
+                            text="Цена продавца по дням за выбранный период (без отменённых заказов) — это деньги покупателя, а не поступление на счёт. Период задаётся выбором месяца в разделе «Деньги: от реализации до счёта» и общий для всех разделов, включая график по часам."
                             label="Пояснение к тренду выручки"
                         />
                     </span>
@@ -2387,116 +2682,16 @@
 
     <section class="insights-section">
         <div class="bento-header">
-            <h2 class="section-title">Склад и капитал · {periodLabel}</h2>
-            <InfoTip
-                text="Сколько денег вложено в товар на складе и как быстро они возвращаются. Запас в закупке — это оборотный капитал по вашей себестоимости, а не по цене продажи. Оборачиваемость и GMROI считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним, — при ровном складе это близко к среднему. Упускается в день: товар продаётся, но его нет на складе, поэтому каждая строка показывает потерю за сутки, а не выдуманный итог за неизвестный срок простоя."
-                label="Пояснение к капиталу"
-            />
-        </div>
-
-        {#if showSkeletons}
-            <div class="kpi-strip" aria-hidden="true">
-                {#each [1, 2, 3, 4] as chip (chip)}
-                    <div class="kpi-chip glass-panel">
-                        <span class="skeleton sk-line"></span>
-                        <span class="skeleton sk-chip"></span>
-                    </div>
-                {/each}
-            </div>
-        {:else}
-            <div class="kpi-strip">
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Запас в закупке</span>
-                    <span class="kpi-value"
-                        >{capital.stockAtCost === null
-                            ? "—"
-                            : formatCurrency(capital.stockAtCost)}</span
-                    >
-                    <span class="kpi-delta"
-                        >в ценах продажи
-                        {formatCurrency(capital.stockAtRetail)}
-                        {capital.costedShare < 1
-                            ? ` · себестоимость известна для ${formatPercent(capital.costedShare * 100, 0)} запаса`
-                            : ""}</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Оборачиваемость</span>
-                    <span class="kpi-value"
-                        >{capital.turnoverRatio === null
-                            ? "—"
-                            : `${capital.turnoverRatio.toFixed(2).replace(".", ",")}×`}</span
-                    >
-                    <span class="kpi-delta"
-                        >{capital.daysOfStock === null
-                            ? "нужна полная себестоимость"
-                            : `запас на ${Math.round(capital.daysOfStock)} дн.`}</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">GMROI</span>
-                    <span class="kpi-value"
-                        >{capital.gmroi === null
-                            ? "—"
-                            : formatPercent(capital.gmroi, 0)}</span
-                    >
-                    <span class="kpi-delta">валовая прибыль на рубль запаса</span>
-                </div>
-                <div class="kpi-chip glass-panel" class:alert={capital.lostRows.length > 0}>
-                    <span class="kpi-label">Упускается в день</span>
-                    <span class="kpi-value"
-                        >{formatCurrency(
-                            capital.lostProfitPerDay ?? capital.lostRevenuePerDay,
-                        )}</span
-                    >
-                    <span class="kpi-delta">
-                        {#if capital.lostRows.length === 0}
-                            нет товаров в дефиците со спросом
-                        {:else if capital.lostProfitPerDay === null}
-                            выручка · {capital.lostRows.length} SKU в дефиците
-                        {:else}
-                            маржа · {capital.lostRows.length} SKU в дефиците
-                        {/if}
-                    </span>
-                </div>
-                <div class="kpi-chip glass-panel" class:alert={capital.frozenSkus > 0}>
-                    <span class="kpi-label">Заморожено в неликвиде</span>
-                    <span class="kpi-value"
-                        >{capital.frozenAtCost === null
-                            ? `${formatNumber(capital.frozenUnits)} шт`
-                            : formatCurrency(capital.frozenAtCost)}</span
-                    >
-                    <span class="kpi-delta"
-                        >{capital.frozenSkus} SKU · {formatNumber(
-                            capital.frozenUnits,
-                        )} шт</span
-                    >
-                </div>
-                <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Sell-through</span>
-                    <span class="kpi-value"
-                        >{capital.sellThrough === null
-                            ? "—"
-                            : formatPercent(capital.sellThrough, 0)}</span
-                    >
-                    <span class="kpi-delta">продано от проданного и лежащего</span>
-                </div>
-            </div>
-
-        {/if}
-    </section>
-    <section class="insights-section">
-        <div class="bento-header">
             <h2 class="section-title">Склад · остатки по товарам</h2>
             <InfoTip
-                text="Сопоставление продаж за 14 дней с текущими остатками. «Продаж/день» — средний спрос в штуках, «Хватит на» — на сколько дней хватит склада при этом темпе (запас в днях)."
+                text="Сопоставление продаж за 14 дней с текущими остатками. «Продаж/день» — средний спрос в штуках, «Хватит на» — на сколько дней хватит склада при этом темпе (запас в днях). «Запас в закупке» — это оборотный капитал по вашей себестоимости, а не по цене продажи; рядом для сравнения та же полка в ценах продажи. «Оборачиваемость» и запас в днях считаются от текущей стоимости запаса, потому что истории остатков мы пока не храним: при ровном складе это близко к среднему."
                 label="Пояснение к остаткам и оборачиваемости"
             />
         </div>
 
         {#if stocksLoadingNow}
             <div class="kpi-strip" aria-hidden="true">
-                {#each [1, 2, 3, 4, 5, 6] as chip (chip)}
+                {#each [1, 2, 3, 4, 5] as chip (chip)}
                     <div class="kpi-chip glass-panel">
                         <span class="skeleton sk-line"></span>
                         <span class="skeleton sk-chip"></span>
@@ -2532,17 +2727,38 @@
                     <span class="kpi-label">Стоимость остатков</span>
                     <span class="kpi-value">{formatCurrency(inventory.inventoryValue)}</span>
                 </div>
-                <div class="kpi-chip glass-panel alert">
-                    <span class="kpi-label">Нет в наличии</span>
-                    <span class="kpi-value">{inventory.outOfStock.length}</span>
-                </div>
-                <div class="kpi-chip glass-panel alert">
-                    <span class="kpi-label">Критично</span>
-                    <span class="kpi-value">{inventory.critical.length}</span>
+                <!--
+                    Moved here from the capital section: they describe the same stock the table
+                    below lists, and a reader who wants to know what is lying in the warehouse
+                    should not have to look in two places for its cost and its speed.
+                -->
+                <div class="kpi-chip glass-panel">
+                    <span class="kpi-label">Запас в закупке</span>
+                    <span class="kpi-value"
+                        >{capital.stockAtCost === null
+                            ? "—"
+                            : formatCurrency(capital.stockAtCost)}</span
+                    >
+                    <span class="kpi-delta"
+                        >в ценах продажи
+                        {formatCurrency(capital.stockAtRetail)}
+                        {capital.costedShare < 1
+                            ? ` · себестоимость известна для ${formatPercent(capital.costedShare * 100, 0)} запаса`
+                            : ""}</span
+                    >
                 </div>
                 <div class="kpi-chip glass-panel">
-                    <span class="kpi-label">Без продаж</span>
-                    <span class="kpi-value">{inventory.dead.length}</span>
+                    <span class="kpi-label">Оборачиваемость</span>
+                    <span class="kpi-value"
+                        >{capital.turnoverRatio === null
+                            ? "—"
+                            : `${capital.turnoverRatio.toFixed(2).replace(".", ",")}×`}</span
+                    >
+                    <span class="kpi-delta"
+                        >{capital.daysOfStock === null
+                            ? "нужна полная себестоимость"
+                            : `запас на ${Math.round(capital.daysOfStock)} дн.`}</span
+                    >
                 </div>
             </div>
         {/if}
@@ -3198,54 +3414,10 @@
         margin-bottom: var(--space-lg);
     }
 
-    .bento-grid {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        grid-template-rows: repeat(2, minmax(160px, auto)) minmax(120px, auto);
-        gap: 16px;
-        grid-template-areas:
-            "hero hero week"
-            "hero hero month"
-            "small1 small2 small3";
-    }
-
-    @media (max-width: 1024px) {
-        .bento-grid {
-            grid-template-columns: 1fr 1fr;
-            grid-template-areas:
-                "hero hero"
-                "week month"
-                "small1 small2"
-                "small3 small3";
-        }
-    }
-
-    @media (max-width: 768px) {
-        .bento-grid {
-            display: flex;
-            flex-direction: column;
-        }
-        .hero-card {
-            min-height: 200px;
-        }
-    }
-
-    .bento-card {
-        position: relative;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        padding: var(--space-lg);
-        overflow: hidden;
-        transition:
-            transform 0.3s ease,
-            box-shadow 0.3s ease;
-    }
-
-    .bento-card:hover {
-        transform: translateY(-2px);
-    }
-
+    /*
+        Kept from the bento that used to live here: the panel surface every section shares,
+        and the small currency suffix the card values read.
+    */
     .glass-panel {
         background: rgba(20, 20, 20, 0.4);
         backdrop-filter: blur(20px);
@@ -3255,120 +3427,6 @@
         box-shadow: 0 4px 24px -1px rgba(0, 0, 0, 0.2);
     }
 
-    /* Areas */
-    .hero-card {
-        grid-area: hero;
-    }
-    .bento-grid > div:nth-child(2) {
-        grid-area: week;
-    }
-    .bento-grid > div:nth-child(3) {
-        grid-area: month;
-    }
-    .bento-grid > div:nth-child(4) {
-        grid-area: small1;
-    }
-    .bento-grid > div:nth-child(5) {
-        grid-area: small2;
-    }
-    .bento-grid > div:nth-child(6) {
-        grid-area: small3;
-    }
-
-    /* Hero Styling */
-    .glow-effect {
-        background: radial-gradient(
-                circle at top right,
-                rgba(212, 175, 55, 0.05),
-                transparent 60%
-            ),
-            rgba(20, 20, 20, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        box-shadow:
-            0 0 40px -10px rgba(0, 0, 0, 0.5),
-            inset 0 0 0 1px rgba(255, 255, 255, 0.05);
-    }
-
-    .card-content {
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        position: relative;
-        z-index: 2;
-    }
-
-    .hero-card .card-content {
-        justify-content: space-between;
-    }
-
-    .card-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-    }
-
-    .bento-label {
-        font-family: var(--font-heading);
-        font-size: 0.75rem;
-        text-transform: uppercase;
-        letter-spacing: 0.15em;
-        color: var(--accent-gold);
-        opacity: 0.9;
-        font-weight: 600;
-    }
-
-    .bento-label.small {
-        font-size: 0.65rem;
-        color: var(--text-muted);
-        margin-bottom: auto;
-    }
-
-    .live-indicator {
-        display: inline-block;
-        width: 6px;
-        height: 6px;
-        background: #10b981;
-        border-radius: 50%;
-        box-shadow: 0 0 8px #10b981;
-    }
-
-    /* Typography & Diamond Effect */
-    .diamond-text {
-        font-family: var(--font-heading);
-        font-weight: 700;
-        color: #fff;
-        letter-spacing: -0.02em;
-
-        /* Cold Diamond Gradient */
-        background: linear-gradient(180deg, #ffffff 20%, #eff6ff 100%);
-        -webkit-background-clip: text;
-        background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-shadow: 0 2px 10px rgba(255, 255, 255, 0.15);
-    }
-
-    .text-xl {
-        font-size: clamp(2.5rem, 4vw, 4.5rem);
-        line-height: 1;
-    }
-    .text-lg {
-        font-size: clamp(1.5rem, 2vw, 2.5rem);
-        line-height: 1.1;
-    }
-    .text-md {
-        font-size: 1.5rem;
-        line-height: 1.2;
-    }
-
-    .currency-symbol {
-        font-size: 1.5rem;
-        color: var(--text-muted);
-        vertical-align: top;
-        margin-right: 4px;
-        font-weight: 400;
-        opacity: 0.5;
-    }
-
     .unit {
         font-size: 0.875rem;
         color: var(--text-muted);
@@ -3376,71 +3434,158 @@
         margin-left: 4px;
     }
 
-    .card-main-value {
-        margin: var(--space-md) 0;
+    /* --- The four "right now" cards --- */
+
+    .period-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
     }
 
-    .card-sub-stats {
+    @media (max-width: 1280px) {
+        .period-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+    }
+
+    @media (max-width: 700px) {
+        .period-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    /*
+        One card per period, laid out as SellerBoard lays its own: a coloured head, then the
+        money in a two-column grid with Sales spanning both. The tone is the only thing that
+        differs between the cards, so it is set once per card as a custom property and every
+        rule below reads it.
+    */
+    /*
+        No `overflow: hidden` here: the metrics open tooltips, and a clipped card would cut
+        them off at its own edge. The coloured head is rounded instead, which is what the
+        clipping used to achieve.
+    */
+    .period-card {
+        --tone: var(--accent-gold);
+        --tone-soft: rgba(234, 179, 8, 0.14);
+        --tone-line: rgba(234, 179, 8, 0.32);
+        position: relative;
         display: flex;
-        align-items: center;
-        gap: var(--space-md);
-        padding-top: var(--space-md);
-        border-top: 1px solid rgba(255, 255, 255, 0.05);
-        flex-wrap: wrap;
+        flex-direction: column;
+        transition:
+            transform 0.3s ease,
+            box-shadow 0.3s ease;
     }
 
-    .sub-stat {
+    /*
+        The card itself has to rise, not just the bubble inside it. Every card is its own
+        stacking context — a blurred, transformed panel — so a bubble's own `z-index` is trapped
+        inside it and the next card paints straight over the explanation. Raising the hovered or
+        focused card puts its whole bubble above its neighbours, which is what the reader sees
+        when they point at a metric in the first or last card.
+    */
+    .period-card:hover,
+    .period-card:focus-within {
+        z-index: 30;
+    }
+
+    .period-card:hover {
+        transform: translateY(-2px);
+    }
+
+    .tone-today {
+        --tone: #3b82f6;
+        --tone-soft: rgba(59, 130, 246, 0.16);
+        --tone-line: rgba(59, 130, 246, 0.34);
+    }
+
+    .tone-yesterday {
+        --tone: #38bdf8;
+        --tone-soft: rgba(56, 189, 248, 0.14);
+        --tone-line: rgba(56, 189, 248, 0.3);
+    }
+
+    .tone-monthToDate {
+        --tone: #14b8a6;
+        --tone-soft: rgba(20, 184, 166, 0.14);
+        --tone-line: rgba(20, 184, 166, 0.3);
+    }
+
+    .tone-lastMonth {
+        --tone: #22c55e;
+        --tone-soft: rgba(34, 197, 94, 0.14);
+        --tone-line: rgba(34, 197, 94, 0.3);
+    }
+
+    .period-card-head {
         display: flex;
         flex-direction: column;
         gap: 2px;
+        padding: var(--space-sm) var(--space-md);
+        background: var(--tone-soft);
+        /* The card's own radius, since the card no longer clips its children. */
+        border-radius: 20px 20px 0 0;
+        border-bottom: 1px solid var(--tone-line);
     }
 
-    .sub-label {
-        font-size: 0.6rem;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        color: var(--text-muted);
+    .period-card-title {
+        font-family: var(--font-heading);
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: var(--text-primary);
     }
 
-    .sub-value {
-        font-family: var(--font-body);
-        font-size: 0.9rem;
+    .period-card-range {
+        font-size: var(--text-xs);
         color: var(--text-secondary);
-        font-weight: 500;
     }
 
-    .separator {
-        width: 1px;
-        height: 24px;
-        background: rgba(255, 255, 255, 0.1);
-    }
-
-    .text-error {
-        color: var(--error);
-    }
-
-    /* Medium & Small specific */
-    .medium-card .card-content {
-        justify-content: space-between;
-    }
-
-    .card-value-group {
-        margin: auto 0;
-    }
-
-    .small-card {
-        align-items: flex-start;
+    .period-card-body {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-md);
         padding: var(--space-md);
     }
 
-    .small-value {
-        margin-top: 8px;
-        margin-bottom: 4px;
+    /*
+        The metric wrappers themselves live in `MetricTip` now, which owns the label, the
+        tooltip and the layout; what is left here styles the figures the cards pass into it.
+    */
+    .metric-value {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 6px;
+        font-family: var(--font-heading);
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--text-primary);
     }
 
-    .micro-stat {
-        font-size: 0.7rem;
-        color: var(--text-muted);
+    .metric-lead {
+        font-size: clamp(1.5rem, 1.2rem + 0.8vw, 2rem);
+        letter-spacing: -0.02em;
+    }
+
+    .metric-aside {
+        font-size: 0.8rem;
+        font-weight: 500;
+        color: var(--text-secondary);
+    }
+
+    .metric-delta {
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--success);
+    }
+
+    .metric-delta.negative {
+        color: var(--error);
+    }
+
+    /* A withheld figure: not zero, and not a colour that reads as one. */
+    .metric-unknown {
+        color: var(--text-disabled);
     }
 
     @keyframes shimmer {
@@ -3881,13 +4026,6 @@
         color: var(--text-muted);
     }
 
-    /* The figures beside a bento number: stacked, with the little gap that separates them. */
-    .micro-stat-group {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-    }
-
     /*
         The tap area along the top of the viewport, for touch only. Tall enough to catch a
         thumb without aiming, and inert until the header is gone — see `showTopStrip`.
@@ -4005,7 +4143,6 @@
             gap: var(--space-sm);
         }
 
-        .bento-card,
         .panel {
             padding: var(--space-md);
         }
@@ -4049,46 +4186,12 @@
         letter-spacing: 0.06em;
     }
 
-    .live-indicator.busy {
-        animation: dot-pulse 1.4s ease-in-out infinite;
-    }
-
-    /* Stale data is not "live": say so in colour, not only in a tooltip. */
-    .live-indicator.stale {
-        background: var(--warning);
-        box-shadow: 0 0 8px var(--warning);
-    }
-
-    @keyframes dot-pulse {
-        0%,
-        100% {
-            opacity: 1;
-            transform: scale(1);
-        }
-        50% {
-            opacity: 0.35;
-            transform: scale(1.35);
-        }
-    }
-
     /* Placeholder shapes. Sizes mirror the content they stand in for, so the
        layout does not jump when the numbers arrive. */
-    .sk-hero {
-        height: 3.5rem;
-        width: 70%;
-        margin-bottom: var(--space-md);
-    }
-
     .sk-medium {
         height: 2rem;
         width: 60%;
         margin: var(--space-sm) 0;
-    }
-
-    .sk-small {
-        height: 1.5rem;
-        width: 55%;
-        margin-top: 8px;
     }
 
     .sk-line {
@@ -4201,93 +4304,18 @@
         background: rgba(255, 255, 255, 0.06);
     }
 
-    /* Class letters carry the meaning, so they are visible rather than colour-only. */
-    .abc-badge {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 18px;
-        height: 18px;
-        margin-right: 6px;
-        border-radius: 4px;
-        font-size: 0.65rem;
-        font-weight: 700;
-        background: rgba(255, 255, 255, 0.08);
-        color: var(--text-primary);
-    }
-
-    .abc-badge[data-grade="A"] {
-        background: rgba(16, 185, 129, 0.18);
-        color: #34d399;
-    }
-
-    .abc-badge[data-grade="B"] {
-        background: rgba(234, 179, 8, 0.16);
-        color: var(--accent-gold);
-    }
-
-    .loss-panel {
-        margin-top: var(--space-lg);
-        border-color: rgba(239, 68, 68, 0.3);
-    }
-
-    .loss-list {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-    }
-
-    .loss-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        gap: var(--space-md);
-    }
-
-    .loss-name {
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-size: var(--text-sm);
-        color: var(--text-primary);
-    }
-
-    .loss-money {
-        text-align: right;
-        white-space: nowrap;
-    }
-
-    .loss-value {
-        display: block;
-        color: var(--error);
-        font-weight: 600;
-        font-variant-numeric: tabular-nums;
-    }
-
-    .loss-detail {
-        display: block;
-        font-size: 0.7rem;
-        color: var(--text-muted);
-    }
-
-    /* Period selector bar, sitting above every money section it controls. */
-    .period-bar {
+    /*
+        The month control and the cost book, on the right of the money section's heading. They
+        sit in the section they drive rather than in a bar of their own above every money
+        section: the cards at the top of the page ignore this control by design, and a bar
+        spanning the page read as though it filtered them too.
+    */
+    .period-inline {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
-        justify-content: space-between;
-        gap: var(--space-md);
-        padding: var(--space-md) var(--space-lg);
-        /* A group boundary, so it takes the section rhythm rather than a panel gap. */
-        margin-bottom: var(--space-xxl);
-    }
-
-    .period-text {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        min-width: 0;
+        gap: var(--space-sm);
+        margin-left: auto;
     }
 
     .period-title {
@@ -4297,12 +4325,6 @@
         color: var(--text-primary);
         text-transform: uppercase;
         letter-spacing: 0.08em;
-    }
-
-    .period-note {
-        font-size: 0.72rem;
-        color: var(--text-muted);
-        line-height: 1.4;
     }
 
     /* --- Month: payout, weekly split, tax and cost --- */

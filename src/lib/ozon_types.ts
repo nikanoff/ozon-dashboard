@@ -185,6 +185,31 @@ export interface StockRow {
     }[];
 }
 
+/**
+ * One return, reduced to what the dashboard's period cards read.
+ *
+ * `date` is `logistic.return_date` — the moment the return was registered, which is also
+ * the field `/v1/returns/list` filters on. The method ignores `since`/`to` entirely and
+ * answers with the same first page whatever they say, so the filter must be spelled as
+ * `logistic_return_date.{time_from,time_to}`; the identifier is kept because that is the
+ * only thing `last_id` paging can follow.
+ *
+ * `amount` is the sale price of the returned units, not what Ozon refunded: the refund
+ * itself appears in the accruals as a reversed accrual, while this figure is what the
+ * line was worth when it sold.
+ */
+export interface OzonReturn {
+    id: number;
+    /** Local calendar day of `logistic.return_date`. */
+    date: string;
+    sku: number;
+    offerId: string;
+    units: number;
+    amount: number;
+    /** Ozon's own `type`: `Cancellation` (не забрал заказ) or `ClientReturn`. */
+    type: string;
+}
+
 export interface DashboardPayload {
     postings: DashboardPosting[];
     skuToImage: Record<number, string>;
@@ -192,6 +217,14 @@ export interface DashboardPayload {
     fetchedAt: string;
     /** Postings older than this fall outside the dashboard's widest period. */
     oldestAllowed: string;
+    /**
+     * Returns for the period cards, and the window they were collected for.
+     *
+     * Kept apart from the postings: returns are asked for by their own date field and only
+     * the cards read them, so the window is stated rather than inferred from `ranges`.
+     */
+    returns?: OzonReturn[];
+    returnsWindow?: { from: string; to: string };
     /**
      * The ranges this payload actually holds, as `YYYY-MM-DD` pairs, oldest first.
      *

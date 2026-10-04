@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     formatCurrency,
     formatCurrencyParts,
+    formatCurrencyPrecise,
     formatDay,
     formatDelta,
     formatNumber,
@@ -12,6 +13,24 @@ describe('formatCurrency', () => {
     it('formats in roubles with grouped thousands', () => {
         expect(formatCurrency(1234567)).toContain('1');
         expect(formatCurrency(0)).toContain('0');
+    });
+});
+
+describe('formatCurrencyPrecise', () => {
+    it('keeps kopecks, so a breakdown adds up on screen', () => {
+        // September 2026: the rounded parts read 149 955 − 12 742 = 137 213 against a total of
+        // 137 214 ₽, a whole rouble of apparent error in arithmetic that is exact.
+        const orders = 149955.5;
+        const cabinet = -12741.79;
+
+        expect(formatCurrencyPrecise(orders)).toContain('149');
+        expect(formatCurrencyPrecise(orders)).toMatch(/50/);
+        expect(formatCurrencyPrecise(cabinet)).toMatch(/12\D?741\D?79/);
+        expect(formatCurrencyPrecise(orders + cabinet)).toBe(formatCurrencyPrecise(137213.71));
+    });
+
+    it('always shows two decimals, including on a whole rouble', () => {
+        expect(formatCurrencyPrecise(1196)).toMatch(/00/);
     });
 });
 

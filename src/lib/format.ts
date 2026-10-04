@@ -13,10 +13,32 @@ export const currencyFormatter = new Intl.NumberFormat('ru-RU', {
     maximumFractionDigits: 0
 });
 
+/** The same, keeping kopecks: for breakdowns whose parts must visibly sum. */
+export const preciseCurrencyFormatter = new Intl.NumberFormat('ru-RU', {
+    style: 'currency',
+    currency: 'RUB',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+});
+
 export const numberFormatter = new Intl.NumberFormat('ru-RU');
 
 export function formatCurrency(value: number): string {
     return currencyFormatter.format(value);
+}
+
+/**
+ * Money with kopecks, for figures that are supposed to add up on screen.
+ *
+ * The headline format rounds to whole rubles, which is right for a card: nobody reads a
+ * dashboard to the kopeck. It is wrong for a breakdown, where the reader checks that the parts
+ * make the whole — September's accruals were 149 955,50 ₽ of orders and −12 741,79 ₽ of
+ * cabinet costs, and rounded those read 149 955 − 12 742 = 137 213 against a total of
+ * 137 214 ₽. A one-ruble gap in arithmetic that is actually exact is worse than a longer
+ * number: it makes the reader doubt the whole screen.
+ */
+export function formatCurrencyPrecise(value: number): string {
+    return preciseCurrencyFormatter.format(value);
 }
 
 export function formatNumber(value: number): string {

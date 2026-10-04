@@ -68,18 +68,22 @@ async function callBundle<T>(
  * Orders, statistics and product images for the dashboard.
  *
  * Pass `since` to re-read only the recent tail of the history; the caller merges
- * that into the payload it already holds.
+ * that into the payload it already holds. `extra` states the period cards' previous
+ * calendar month: the server adds it as a third range only when the other two do not
+ * already hold it, and uses its start as the returns window either way.
  */
 export function getDashboardData(
     signal?: AbortSignal,
     since?: string,
     windowFrom?: string,
-    windowTo?: string
+    windowTo?: string,
+    extra?: { from: string; to: string }
 ) {
     return callBundle<DashboardPayload>('/api/dashboard', signal, {
         ...(since ? { since } : {}),
         ...(windowFrom ? { windowFrom } : {}),
-        ...(windowTo ? { windowTo } : {})
+        ...(windowTo ? { windowTo } : {}),
+        ...(extra ? { extraFrom: extra.from, extraTo: extra.to } : {})
     });
 }
 
@@ -114,6 +118,18 @@ export interface MonthFinancePayload extends MonthFinance {
 }
 
 /**
+ * Only the realization report for a month.
+ *
+ * Used by the period cards: a revenue-based tax is charged on the realized revenue, which
+ * only this monthly document states. One request instead of the three the full bundle costs.
+ */
+export interface MonthRealizationPayload {
+    month: string;
+    realization: MonthFinance['realization'];
+    fetchedAt: string;
+}
+
+/**
  * A single month of financial figures.
  *
  * This is what reaches months the order feed cannot: Ozon's realization report is a monthly
@@ -121,4 +137,12 @@ export interface MonthFinancePayload extends MonthFinance {
  */
 export function getMonthFinance(signal: AbortSignal | undefined, month: string) {
     return callBundle<MonthFinancePayload>('/api/finance', signal, { month });
+}
+
+/** The realization report alone, for the cards' tax base. */
+export function getMonthRealization(signal: AbortSignal | undefined, month: string) {
+    return callBundle<MonthRealizationPayload>('/api/finance', signal, {
+        month,
+        only: 'realization'
+    });
 }

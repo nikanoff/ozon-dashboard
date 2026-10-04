@@ -151,6 +151,90 @@ if (dashboard.status !== 200) {
     check('снимки товаров есть', Object.keys(dashboard.body.skuToImage ?? {}).length > 0);
 }
 
+// --- The period cards: the previous calendar month beside an older selected month ----
+//
+// This is the shape that costs a real request: an old month on screen means the payload holds
+// that month and today's tail, with the cards' month — the previous calendar month — inside
+// the hole between them. The cards need orders, returns and accruals for it, so all three are
+// checked here against the endpoint the page actually calls.
+const cardsMonth = arg('cards-month', '2026-03');
+const [cardsYear, cardsNumber] = cardsMonth.split('-').map(Number);
+const cardsLastDay = new Date(cardsYear, cardsNumber, 0).getDate();
+const previousDay = new Date(cardsYear, cardsNumber - 2, 1);
+const previousMonth = `${previousDay.getFullYear()}-${String(previousDay.getMonth() + 1).padStart(2, '0')}`;
+const previousLastDay = new Date(previousDay.getFullYear(), previousDay.getMonth() + 1, 0).getDate();
+const extraFrom = `${previousMonth}-01`;
+const extraTo = `${previousMonth}-${String(previousLastDay).padStart(2, '0')}`;
+
+console.log(`\n/api/dashboard — карточки: месяц на экране ${cardsMonth}, прошлый ${previousMonth}`);
+const cards = await post('/api/dashboard', {
+    windowFrom: `${cardsMonth}-01`,
+    windowTo: `${cardsMonth}-${String(cardsLastDay).padStart(2, '0')}`,
+    extraFrom,
+    extraTo
+});
+if (cards.status !== 200) {
+    check('карточки: endpoint отвечает 200', false, `HTTP ${cards.status}`);
+} else {
+    const ranges = cards.body.ranges ?? [];
+    const returns = cards.body.returns ?? [];
+    const window = cards.body.returnsWindow ?? {};
+    const coversCardsMonth = ranges.some(
+        (range) => range.from <= extraFrom && range.to >= extraTo
+    );
+    const returnsInside = returns.every((row) => row.date >= window.from && row.date <= window.to);
+    const returnsNamed = returns.every(
+        (row) => row.sku > 0 && row.units > 0 && typeof row.amount === 'number' && row.date
+    );
+    const inPreviousMonth = returns.filter((row) => row.date.slice(0, 7) === previousMonth);
+
+    console.log(
+        `  диапазоны: ${ranges.map((range) => `${range.from}…${range.to}`).join(', ')}`
+    );
+    console.log(
+        `  возвратов ${returns.length}, из них за ${previousMonth}: ${inPreviousMonth.length}, ` +
+            `окно возвратов ${window.from}…${window.to}`
+    );
+    check('карточки: endpoint отвечает 200', true);
+    check('прошлый календарный месяц покрыт диапазоном', coversCardsMonth);
+    check('возвраты пришли', returns.length > 0, `${returns.length}`);
+    check('возвраты разобраны в записи', returnsNamed, `${returns.length} записей`);
+    check('окно возвратов начинается с прошлого месяца', window.from === extraFrom, `${window.from}`);
+    check('все возвраты внутри своего окна', returnsInside);
+}
+
+// The accruals the cards read: the previous calendar month and the current one.
+const cardDates = [];
+for (let day = 1; day <= previousLastDay; day += 1) {
+    cardDates.push(`${previousMonth}-${String(day).padStart(2, '0')}`);
+}
+const today = new Date();
+for (let day = 1; day <= today.getDate(); day += 1) {
+    cardDates.push(
+        `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+    );
+}
+
+console.log(`\n/api/economics — дни карточек: ${cardDates.length} дн. (${previousMonth} и текущий)`);
+const cardAccruals = await post('/api/economics', { dates: cardDates });
+if (cardAccruals.status !== 200) {
+    check('карточки: начисления отвечают 200', false, `HTTP ${cardAccruals.status}`);
+} else {
+    const days = cardAccruals.body.days ?? [];
+    const failedDays = days.filter((day) => day.status === 'failed');
+    const advertising = days.reduce((sum, day) => {
+        const rows = day.byType ?? {};
+        return sum + Math.abs(Number(rows['41'] ?? 0));
+    }, 0);
+
+    console.log(
+        `  дней ${days.length}, упало ${failedDays.length}, оплата за клик ${money(advertising)}`
+    );
+    check('карточки: начисления отвечают 200', true);
+    check('ни один день карточек не упал', failedDays.length === 0, `${failedDays.length}`);
+    check('все запрошенные дни вернулись', days.length === cardDates.length, `${days.length}`);
+}
+
 // --- Monthly finance, including a month the order feed cannot reach ---------------
 const oldMonth = arg('old-month', '2026-03');
 console.log(`\n/api/finance — ${oldMonth} (старше окна заказов)`);
@@ -186,6 +270,39 @@ if (finance.status !== 200) {
     );
     check('недельная разбивка есть', weeks.length > 0, `${weeks.length} недель`);
     check('ошибок в ответе нет', !finance.body.partialError, finance.body.partialError ?? '');
+}
+
+// --- The cards' tax base: the realization report alone, and the same figure ----------
+//
+// The period cards charge a revenue-based tax on the realized revenue, which only the monthly
+// report states — the order feed's seller price is nearly twice it. So the light request has to
+// return the very same document the full bundle does, or the cards and the month sections would
+// disagree about the same month.
+console.log(`\n/api/finance — только отчёт о реализации за ${oldMonth}`);
+const light = await post('/api/finance', { month: oldMonth, only: 'realization' });
+if (light.status !== 200) {
+    check('отчёт о реализации отвечает 200', false, `HTTP ${light.status}`);
+} else {
+    const realization = light.body.realization ?? {};
+    const fullRealization = finance.body?.realization ?? null;
+
+    console.log(
+        `  реализовано ${money(realization.realized)}, возвраты ${money(realization.returned)}, ` +
+            `нетто ${money(realization.net)}, строк ${realization.rows}`
+    );
+    check('отчёт о реализации отвечает 200', true);
+    check('нетто — это реализовано минус возвраты', Math.abs(realization.net - (realization.realized - realization.returned)) < 0.01);
+    check('месяц в ответе тот же, что запрошен', light.body.month === oldMonth, `${light.body.month}`);
+    check(
+        'тот же документ, что в полной сборке',
+        fullRealization !== null && Math.abs(fullRealization.net - realization.net) < 0.01,
+        fullRealization ? `${money(fullRealization.net)} против ${money(realization.net)}` : 'полной сборки нет'
+    );
+    check(
+        'в лёгком ответе нет лишнего',
+        light.body.balance === undefined && light.body.weeks === undefined,
+        Object.keys(light.body).join(', ')
+    );
 }
 
 const failed = results.filter((result) => !result.ok);

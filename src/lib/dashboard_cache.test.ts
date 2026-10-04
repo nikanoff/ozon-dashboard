@@ -144,4 +144,52 @@ describe('mergeDashboardPayload', () => {
         expect(merged.fetchedAt).toBe(fresh.fetchedAt);
         expect(merged.oldestAllowed).toBe(fresh.oldestAllowed);
     });
+
+    describe('returns', () => {
+        const returnRow = (id: number, date: string) => ({
+            id,
+            date,
+            sku: id,
+            offerId: `offer-${id}`,
+            units: 1,
+            amount: 1000,
+            type: 'Cancellation'
+        });
+
+        it('keeps returns from before the refreshed window', () => {
+            const previous = payload([], { returns: [returnRow(1, '2026-08-20')] });
+            const withReturns = payload([], {
+                returns: [returnRow(2, '2026-09-10')],
+                returnsWindow: { from: '2026-09-01', to: '2026-09-16' }
+            });
+
+            const merged = mergeDashboardPayload(previous, withReturns);
+
+            expect(merged.returns?.map((row) => row.id)).toEqual([1, 2]);
+            expect(merged.returnsWindow).toEqual({ from: '2026-09-01', to: '2026-09-16' });
+        });
+
+        it('replaces returns inside the refreshed window instead of duplicating them', () => {
+            const previous = payload([], {
+                returns: [returnRow(2, '2026-09-10')],
+                returnsWindow: { from: '2026-09-01', to: '2026-09-15' }
+            });
+            const refreshed = payload([], {
+                returns: [returnRow(2, '2026-09-10'), returnRow(3, '2026-09-12')],
+                returnsWindow: { from: '2026-09-01', to: '2026-09-16' }
+            });
+
+            const merged = mergeDashboardPayload(previous, refreshed);
+
+            expect(merged.returns?.map((row) => row.id)).toEqual([2, 3]);
+        });
+
+        it('keeps what it has when a fresh payload carries no returns at all', () => {
+            // A payload from an older build has no returns feed; the ones on screen stay.
+            const previous = payload([], { returns: [returnRow(1, '2026-08-20')] });
+            const merged = mergeDashboardPayload(previous, fresh);
+
+            expect(merged.returns?.map((row) => row.id)).toEqual([1]);
+        });
+    });
 });

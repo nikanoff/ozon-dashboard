@@ -27,6 +27,47 @@ export interface MonthFinanceResult extends MonthFinance {
     partialError?: string;
 }
 
+/** Just the monthly document, for a caller that needs nothing else. */
+export interface MonthRealizationResult {
+    month: string;
+    realization: MonthFinance['realization'];
+    fetchedAt: string;
+}
+
+/**
+ * Only the realization report for a month.
+ *
+ * The period cards charge a revenue-based tax on the *realized* revenue, which is a monthly
+ * document: the order feed's seller price is not it (in September 2026 it was 1,96 times
+ * larger, because it includes the discount Ozon funds itself). The cards' own month is the
+ * previous calendar month, which is not always the month the page has selected, so it is
+ * asked for on its own — one request instead of the three the full bundle costs.
+ */
+export async function collectMonthRealization(
+    credentials: Credentials,
+    monthKey: string,
+    signal?: AbortSignal
+): Promise<MonthRealizationResult> {
+    const parts = monthParts(monthKey);
+
+    if (!parts) {
+        throw new Error(`Некорректный месяц: ${monthKey}`);
+    }
+
+    const realization = await callOzonWithRetry<unknown>(
+        '/v2/finance/realization',
+        { month: parts.month, year: parts.year },
+        credentials,
+        signal
+    );
+
+    return {
+        month: monthKey,
+        realization: toRealizationMonth(realization),
+        fetchedAt: new Date().toISOString()
+    };
+}
+
 export async function collectMonthFinance(
     credentials: Credentials,
     monthKey: string,

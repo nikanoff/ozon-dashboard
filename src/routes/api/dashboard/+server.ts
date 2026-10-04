@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { collectFboPostings, collectProductInfo, readCredentials } from '$lib/server/ozon';
+import { collectReturns } from '$lib/server/returns';
 import { ozonErrorResponse } from '$lib/server/errors';
 import { buildSkuImageMap, toDashboardPosting } from '$lib/ozon_map';
 
@@ -29,6 +30,8 @@ const PERIOD_DAYS = 62;
 const MAX_WINDOW_DAYS = 120;
 /** The bento's widest window, measured back from today. */
 const BENTO_WINDOW_DAYS = 31;
+/** Longest extra range accepted: the period cards' previous month. */
+const MAX_EXTRA_DAYS = 62;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -51,6 +54,8 @@ export const POST: RequestHandler = async ({ request }) => {
     const askedFrom = parseDate(body.windowFrom);
     const askedEnd = parseDate(body.windowTo);
     const requested = parseDate(body.since);
+    const extraFrom = parseDate(body.extraFrom);
+    const extraTo = parseDate(body.extraTo);
 
     const floor = new Date(to.getTime() - MAX_WINDOW_DAYS * DAY_MS);
     const defaultFrom = new Date(to.getTime() - PERIOD_DAYS * DAY_MS);
@@ -65,13 +70,19 @@ export const POST: RequestHandler = async ({ request }) => {
         askedFrom && askedFrom < to && (bounded || askedFrom > floor) ? askedFrom : defaultFrom;
 
     /**
-     * Which ranges to walk. Never more than two.
+     * Which ranges to walk. Never more than three.
      *
      * A refresh re-reads the recent tail alone, because only that part can still change. A
      * full load covers the month on screen — and the bento, whose windows are anchored to
      * today rather than to the month, needs today's tail as well. Those two do not meet for
      * an old month, and walking the span between them would fetch a year of orders to display
      * one month, so they are fetched as two ranges and joined.
+     *
+     * The third range exists for the period cards. They are anchored to today and include the
+     * previous calendar month, which is outside both other ranges once an older month is
+     * selected: a 31-day tail starting on 3 September holds two days of it less than it
+     * needs. The client states that month explicitly and the server adds it only when the
+     * ranges above do not already hold it.
      */
     const windowEnd = bounded && askedEnd > oldestAllowed ? askedEnd : to;
     const recentFrom = new Date(to.getTime() - BENTO_WINDOW_DAYS * DAY_MS);
@@ -89,12 +100,28 @@ export const POST: RequestHandler = async ({ request }) => {
         ];
     }
 
+    const cardRange = extraRange(extraFrom, extraTo, to, ranges);
+    if (cardRange) ranges.push(cardRange);
+
+    /**
+     * The returns window: the previous calendar month through today.
+     *
+     * Only the cards read returns, and their oldest window is the previous calendar month.
+     * `extraFrom` is exactly that month's first day; without it (an older client) the recent
+     * tail is the best available guess, so the window never degrades to nothing.
+     */
+    const returnsDaysFrom = extraFrom && extraFrom < to ? extraFrom : recentFrom;
+    const returnsFrom = returnsDaysFrom < recentFrom ? returnsDaysFrom : recentFrom;
+
     try {
-        const walks = await Promise.all(
-            ranges.map(([rangeFrom, rangeTo]) =>
-                collectFboPostings(credentials, rangeFrom, rangeTo, signal)
-            )
-        );
+        const [walks, returns] = await Promise.all([
+            Promise.all(
+                ranges.map(([rangeFrom, rangeTo]) =>
+                    collectFboPostings(credentials, rangeFrom, rangeTo, signal)
+                )
+            ),
+            collectReturns(credentials, returnsFrom, to, signal)
+        ]);
 
         // Ranges can overlap at their edges; a posting must not be counted twice.
         const byNumber = new Map<string, (typeof walks)[number][number]>();
@@ -126,21 +153,55 @@ export const POST: RequestHandler = async ({ request }) => {
             ranges: ranges.map(([rangeFrom, rangeTo]) => ({
                 from: dayKey(rangeFrom),
                 to: dayKey(rangeTo)
-            }))
+            })),
+            returns,
+            returnsWindow: { from: dayKey(returnsFrom), to: dayKey(to) }
         });
     } catch (error) {
         return ozonErrorResponse(error, 'dashboard');
     }
 };
 
+/**
+ * The period cards' previous calendar month, when the ranges do not already hold it.
+ *
+ * Checked against the ranges rather than against `oldestAllowed`: a payload that holds an old
+ * month beside today's tail has an early edge and a hole, and the month being asked for can
+ * sit inside the hole. A range that is only partly covered is added whole — the postings are
+ * de-duplicated by number afterwards, and splitting a range to save a few cursors would make
+ * the coverage bookkeeping harder to trust than the cursors are expensive.
+ */
+function extraRange(
+    from: Date | null,
+    to: Date | null,
+    now: Date,
+    ranges: Array<[Date, Date]>
+): [Date, Date] | null {
+    if (!from || !to) return null;
+    if (from >= to || to >= now) return null;
+    if (to.getTime() - from.getTime() > MAX_EXTRA_DAYS * DAY_MS) return null;
+    if (ranges.length >= 3) return null;
+
+    const covered = ranges.some(([rangeFrom, rangeTo]) => from >= rangeFrom && to <= rangeTo);
+    return covered ? null : [from, to];
+}
+
 async function readBody(
     request: Request
-): Promise<{ since?: unknown; windowFrom?: unknown; windowTo?: unknown }> {
+): Promise<{
+    since?: unknown;
+    windowFrom?: unknown;
+    windowTo?: unknown;
+    extraFrom?: unknown;
+    extraTo?: unknown;
+}> {
     try {
         return (await request.json()) as {
             since?: unknown;
             windowFrom?: unknown;
             windowTo?: unknown;
+            extraFrom?: unknown;
+            extraTo?: unknown;
         };
     } catch {
         return {};
