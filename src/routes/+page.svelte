@@ -2044,7 +2044,10 @@
                             <span class="order-facts">
                                 <span class="fact">
                                     <span class="fact-label">Оплата</span>
-                                    {posting.analytics_data?.payment_type_group_name || "—"}
+                                    <span class="fact-value"
+                                        >{posting.analytics_data?.payment_type_group_name ||
+                                            "—"}</span
+                                    >
                                 </span>
                                 <span class="fact">
                                     <span class="fact-label">Маршрут</span>
@@ -3300,9 +3303,13 @@
     }
 
     /*
-        Date, status, payment and route on one wrapping line. As four stacked rows they cost a
-        third of the card's height and left most of its width empty; on one line the card reads
-        as a record rather than as a form.
+        Two rows, always: the date and the status, then the facts.
+
+        As four stacked rows this cost a third of the card's height and left most of its width
+        empty; as one wrapping row it was inconsistent — a long route pushed «Оплата» onto the
+        next line in some cards and not in others, so no two cards looked alike. The facts now
+        take a row of their own (`flex-basis: 100%`), which leaves the shape identical
+        everywhere and lets only the text inside a column wrap.
     */
     .order-head {
         display: flex;
@@ -3381,21 +3388,31 @@
         opacity: 0.6;
     }
 
-    /* Pushed to the right of the header, so the card's width carries information. */
+    /*
+        Two rows, one fact each: «Оплата», then «Маршрут». Side by side they still read unevenly
+        — the route is twice as long, so the pair sat differently in every card — while stacked
+        they line up like a specification.
+
+        The label and its value are the grid's own cells (the wrapper is `display: contents`),
+        which gives both rows the same label column without hard-coding a width for it.
+    */
     .order-facts {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 4px 14px;
-        margin-left: auto;
+        flex-basis: 100%;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: baseline;
+        gap: 3px 8px;
+        font-size: 0.8rem;
+        color: var(--text-secondary);
     }
 
     .fact {
-        display: inline-flex;
-        align-items: baseline;
-        gap: 5px;
-        font-size: 0.8rem;
-        color: var(--text-secondary);
+        display: contents;
+    }
+
+    /* The value is the cell that takes the rest of the row, so it has to be allowed to wrap. */
+    .fact-value {
+        min-width: 0;
     }
 
     .fact-label {
